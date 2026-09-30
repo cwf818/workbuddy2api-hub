@@ -3738,14 +3738,17 @@ def chat_to_messages(chat_obj, model):
         content.append({"type": "text", "text": message["content"]})
     for call in message.get("tool_calls") or []:
         fn = call.get("function") or {}
+        name = fn.get("name") or ""
         try:
             tool_input = json.loads(fn.get("arguments") or "{}")
-        except (TypeError, ValueError):
-            tool_input = {}
+        except (TypeError, ValueError) as exc:
+            raise ValueError("upstream tool call %r emitted invalid JSON arguments" % name) from exc
+        if not isinstance(tool_input, dict):
+            raise ValueError("upstream tool call %r emitted non-object arguments" % name)
         content.append({
             "type": "tool_use",
             "id": call.get("id") or _new_id("toolu_"),
-            "name": fn.get("name") or "",
+            "name": name,
             "input": tool_input,
         })
     finish = choice.get("finish_reason") or "stop"
@@ -6809,10 +6812,15 @@ class Handler(BaseHTTPRequestHandler):
         wall = int((time.time() - t_start) * 1000)
         first_at = result.get("first_chunk_at")
         first_ms = int((first_at - t_start) * 1000) if first_at else None
+        try:
+            response = chat_to_messages(result, model)
+        except ValueError as exc:
+            record_error(model, 502, str(exc), elapsed_ms=wall, account=account.uid)
+            return self._error(502, str(exc), "server_error")
         record_usage(model, result.get("usage"), stream=False, elapsed_ms=wall,
                      ttft_ms=first_ms, gen_ms=(wall - first_ms) if first_ms is not None else None,
                      fp=fp, account=account.uid)
-        return self._json(200, chat_to_messages(result, model))
+        return self._json(200, response)
 
     def _messages_stream_response(self, upstream, model, fp, account, t_start):
         """Emit Anthropic SSE events after translating the upstream chat stream."""
@@ -6820,7 +6828,13 @@ class Handler(BaseHTTPRequestHandler):
             result = aggregate_stream(upstream, model, None)
         except Exception as exc:
             return self._error(502, "upstream stream error: %s" % exc)
-        message = chat_to_messages(result, model)
+        try:
+            message = chat_to_messages(result, model)
+        except ValueError as exc:
+            record_error(model, 502, str(exc),
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=account.uid)
+            return self._error(502, str(exc), "server_error")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -6834,11 +6848,32 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         emit("message_start", {"type": "message_start", "message": dict(message, content=[])})
         for index, block in enumerate(message["content"]):
+            if block["type"] == "text":
+                start_block = dict(block, text="")
+            elif block["type"] == "tool_use":
+                # Anthropic clients build tool input exclusively from
+                # input_json_delta events. Supplying it only in the start
+                # event looks valid on the wire but is interpreted as {} by
+                # Claude Code, causing required parameters such as file_path
+                # and command to appear missing.
+                start_block = dict(block, input={})
+            else:
+                start_block = block
             emit("content_block_start", {"type": "content_block_start", "index": index,
-                                         "content_block": dict(block, text="" if block["type"] == "text" else block)})
+                                         "content_block": start_block})
             if block["type"] == "text":
                 emit("content_block_delta", {"type": "content_block_delta", "index": index,
                                              "delta": {"type": "text_delta", "text": block["text"]}})
+            elif block["type"] == "tool_use":
+                emit("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(block["input"], ensure_ascii=False,
+                                                   separators=(",", ":")),
+                    },
+                })
             emit("content_block_stop", {"type": "content_block_stop", "index": index})
         emit("message_delta", {"type": "message_delta",
                                "delta": {"stop_reason": message["stop_reason"], "stop_sequence": None},

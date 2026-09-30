@@ -2,6 +2,8 @@
 import json
 import os
 import sys
+from io import BytesIO
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("ACCOUNTS_DIR", os.path.join(os.path.dirname(__file__), "_acc"))
@@ -57,7 +59,81 @@ check("tool arguments are JSON objects", result["content"][1]["input"] == {"q": 
 check("usage names match Anthropic", result["usage"] == {"input_tokens": 8, "output_tokens": 4})
 
 print()
-print("[2] Messages requests use the shared upstream identity sanitization")
+print("[2] fragmented upstream tool arguments are preserved for Anthropic tools")
+def chunk(delta, finish=None):
+    choice = {"delta": delta}
+    if finish:
+        choice["finish_reason"] = finish
+    return ("data: " + json.dumps({"choices": [choice]}) + "\n").encode()
+
+streamed = P.aggregate_stream(iter([
+    chunk({"tool_calls": [{"index": 0, "id": "call_read",
+                           "function": {"name": "Read", "arguments": '{"file_'}}]}),
+    chunk({"tool_calls": [{"index": 0,
+                           "function": {"arguments": 'path":"C:/repo/a.py"}'}}]}, "tool_calls"),
+]), "m", None)
+read_result = P.chat_to_messages(streamed, "m")
+check("fragmented Read arguments retain file_path",
+      read_result["content"][0]["input"] == {"file_path": "C:/repo/a.py"},
+      read_result["content"][0])
+try:
+    P.chat_to_messages({"choices": [{"message": {"tool_calls": [{
+        "function": {"name": "Read", "arguments": '{"file_path":'}
+    }]}}]}, "m")
+    invalid_arguments_rejected = False
+except ValueError:
+    invalid_arguments_rejected = True
+check("malformed tool arguments fail explicitly instead of becoming empty input",
+      invalid_arguments_rejected)
+
+class CaptureMessagesStream:
+    path = "/v1/messages"
+
+    def __init__(self):
+        self.wfile = BytesIO()
+
+    def send_response(self, _code):
+        pass
+
+    def send_header(self, _name, _value):
+        pass
+
+    def end_headers(self):
+        pass
+
+
+captured = CaptureMessagesStream()
+saved_record_usage = P.record_usage
+P.record_usage = lambda *_args, **_kwargs: None
+try:
+    P.Handler._messages_stream_response(captured, iter([
+        chunk({"tool_calls": [{"index": 0, "id": "call_read",
+                               "function": {"name": "Read",
+                                            "arguments": '{"file_path":"C:/repo/a.py"}'}}]},
+              "tool_calls"),
+    ]), "m", None, SimpleNamespace(uid="test-account"), 0)
+finally:
+    P.record_usage = saved_record_usage
+
+frames = []
+for frame in captured.wfile.getvalue().decode().strip().split("\n\n"):
+    data_line = next((line for line in frame.splitlines() if line.startswith("data: ")), "")
+    if data_line:
+        frames.append(json.loads(data_line[6:]))
+tool_start = next(frame for frame in frames
+                  if frame.get("type") == "content_block_start"
+                  and frame.get("content_block", {}).get("type") == "tool_use")
+tool_delta = next(frame for frame in frames
+                  if frame.get("type") == "content_block_delta"
+                  and frame.get("delta", {}).get("type") == "input_json_delta")
+check("tool-use start event has an empty input object",
+      tool_start["content_block"]["input"] == {}, tool_start)
+check("tool-use JSON delta carries file_path",
+      json.loads(tool_delta["delta"]["partial_json"]) == {"file_path": "C:/repo/a.py"},
+      tool_delta)
+
+print()
+print("[3] Messages requests use the shared upstream identity sanitization")
 fingerprint = "Sisyphus-Junior - Focused executor from OhMyOpenCode"
 dirty = P.messages_to_chat({
     "model": "m",
