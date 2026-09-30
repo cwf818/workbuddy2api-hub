@@ -27,6 +27,26 @@ class FingerprintSanitizationTests(unittest.TestCase):
         self.assertEqual(P.sanitize_text("from OhMyOpenCode alone"), "from OhMyOpenCode alone")
         self.assertEqual(P.sanitize_text("Sisyphus master agent"), "Sisyphus master agent")
 
+    def test_claude_code_agent_context_is_neutralized_before_upstream(self):
+        phrase = "A user kicked off a Claude Code agent to do a coding task and walked away"
+        outbound = P.build_upstream_body({
+            "model": "m",
+            "messages": [{"role": "system", "content": phrase},
+                         {"role": "user", "content": "Continue the task."}],
+        })
+        system = outbound["messages"][0]["content"]
+        self.assertNotIn("Claude Code agent", system)
+        self.assertEqual(system, "A user kicked off a coding task and walked away")
+        responses_outbound = P.build_upstream_body(P.responses_to_chat({
+            "model": "m", "instructions": phrase, "input": "Continue the task.",
+        }))
+        self.assertNotIn("Claude Code agent", responses_outbound["messages"][0]["content"])
+
+    def test_claude_agent_sdk_identity_is_neutralized(self):
+        phrase = "You are a Claude agent, built on Anthropic's Claude Agent SDK"
+        self.assertEqual(P.sanitize_text(phrase), "You are a coding agent")
+        self.assertEqual(P.sanitize_text(phrase.lower()), "You are a coding agent")
+
     def test_sanitize_messages_covers_all_roles_and_tool_args(self):
         fp = "Sisyphus-Junior - Focused executor from OhMyOpenCode"
         clean = "Sisyphus-Junior - Focused executor"
@@ -56,4 +76,3 @@ class FingerprintSanitizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
