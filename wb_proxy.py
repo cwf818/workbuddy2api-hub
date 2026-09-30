@@ -3599,6 +3599,157 @@ def aggregate_stream(raw_iter, model, resp_id):
     out["first_chunk_at"] = first_chunk_at
     return out
 # ---------------------------------------------------------------------------
+# Anthropic Messages API (/v1/messages) <-> Chat Completions translation
+# ---------------------------------------------------------------------------
+#
+# Claude Code and the Anthropic SDK speak Messages rather than OpenAI's Chat
+# Completions format.  Keep this adapter next to the Responses adapter: both
+# deliberately translate at the edge and share the same upstream/account path.
+def _anthropic_text(content):
+    """Extract text from an Anthropic content value without losing text blocks."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(block.get("text") or block.get("thinking") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") in ("text", "thinking")
+    )
+
+
+def messages_to_chat(payload):
+    """Translate a stateless Anthropic Messages request into Chat Completions."""
+    messages = []
+    system = _anthropic_text(payload.get("system"))
+    if system:
+        messages.append({"role": "system", "content": system})
+    for source in payload.get("messages") or []:
+        if not isinstance(source, dict):
+            continue
+        role = source.get("role")
+        content = source.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        text_parts, image_parts, tool_calls = [], [], []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text":
+                text_parts.append(str(block.get("text") or ""))
+            elif kind == "thinking" and role == "assistant":
+                text_parts.append(str(block.get("thinking") or ""))
+            elif kind == "image" and role == "user":
+                source_data = block.get("source") or {}
+                if source_data.get("type") == "base64" and source_data.get("data"):
+                    mime = source_data.get("media_type") or "image/png"
+                    image_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": "data:%s;base64,%s" % (mime, source_data["data"])},
+                    })
+            elif kind == "tool_use" and role == "assistant":
+                tool_calls.append({
+                    "id": block.get("id") or _new_id("call_"),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name") or "",
+                        "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                    },
+                })
+            elif kind == "tool_result" and role == "user":
+                result = _anthropic_text(block.get("content"))
+                if not result and block.get("content") is not None:
+                    result = str(block.get("content"))
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id") or "",
+                    "content": result,
+                })
+        if text_parts or image_parts or tool_calls:
+            message = {
+                "role": role,
+                "content": image_parts or "\n".join(p for p in text_parts if p),
+            }
+            if image_parts and text_parts:
+                message["content"] = [{"type": "text", "text": "\n".join(text_parts)}] + image_parts
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            messages.append(message)
+    chat = {"model": payload.get("model"), "messages": messages}
+    for key in ("temperature", "top_p"):
+        if payload.get(key) is not None:
+            chat[key] = payload[key]
+    if payload.get("max_tokens") is not None:
+        chat["max_tokens"] = payload["max_tokens"]
+    tools = []
+    for tool in payload.get("tools") or []:
+        if not isinstance(tool, dict) or not tool.get("name"):
+            continue
+        tools.append({
+            "type": "function",
+            "name": tool["name"],
+            "description": tool.get("description") or "",
+            "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+        })
+    if tools:
+        chat["tools"] = tools
+    choice = payload.get("tool_choice")
+    if isinstance(choice, dict):
+        typ = choice.get("type")
+        if typ == "tool":
+            chat["tool_choice"] = (choice.get("name") or "auto")
+        elif typ in ("auto", "any", "none"):
+            chat["tool_choice"] = "required" if typ == "any" else typ
+    return chat
+
+
+def chat_to_messages(chat_obj, model):
+    """Fold an aggregated Chat Completions response into an Anthropic message."""
+    choice = (chat_obj.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = []
+    # Anthropic's thinking blocks require a cryptographic signature produced by
+    # Anthropic. The upstream's reasoning trace has no compatible signature, so
+    # do not emit a syntactically invalid thinking block.
+    if message.get("content"):
+        content.append({"type": "text", "text": message["content"]})
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        try:
+            tool_input = json.loads(fn.get("arguments") or "{}")
+        except (TypeError, ValueError):
+            tool_input = {}
+        content.append({
+            "type": "tool_use",
+            "id": call.get("id") or _new_id("toolu_"),
+            "name": fn.get("name") or "",
+            "input": tool_input,
+        })
+    finish = choice.get("finish_reason") or "stop"
+    stop_reason = {"tool_calls": "tool_use", "length": "max_tokens"}.get(finish, "end_turn")
+    usage = chat_obj.get("usage") or {}
+    return {
+        "id": _new_id("msg_"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens") or 0,
+            "output_tokens": usage.get("completion_tokens") or 0,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Responses API (/v1/responses) <-> Chat Completions translation
 # ---------------------------------------------------------------------------
 #
@@ -6597,6 +6748,90 @@ class Handler(BaseHTTPRequestHandler):
                 upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
                 base_body=chat_req, session_key=session_key, realm=req_realm)
 
+    def _handle_messages(self, payload):
+        """Serve Anthropic's stateless /v1/messages API through the chat upstream."""
+        chat_req = messages_to_chat(payload)
+        model = payload.get("model") or "hy4-preview"
+        want_stream = bool(payload.get("stream"))
+        t_start = time.time()
+        fp = prompt_fingerprint(chat_req.get("messages"))
+        try:
+            req_realm = self._request_realm() or CURRENT_REALM
+            blocked = self._cross_realm_error(model, req_realm)
+            if blocked:
+                return self._error(400, blocked, "invalid_request_error")
+            banned = self._banned_model_error(model)
+            if banned:
+                return self._error(400, banned, "invalid_request_error")
+            key_blocked = self._key_model_error(model)
+            if key_blocked:
+                return self._error(400, key_blocked, "invalid_request_error")
+            upstream, account = open_upstream(
+                chat_req, session_key=extract_session_key(self.headers, payload),
+                target_realm=req_realm)
+        except ContentRejected as exc:
+            return self._error(403, "upstream 403: %s" % (exc.detail or "content rejected"),
+                               "invalid_request_error")
+        except RateLimited as exc:
+            return self._rate_limited(exc)
+        except urllib.error.HTTPError as exc:
+            return self._error(exc.code, "upstream %d: %s" %
+                               (exc.code, exc.read(600).decode("utf-8", "replace")))
+        except Exception as exc:
+            message = str(exc)
+            if message.startswith("no usable account"):
+                return self._error(503, message + " - add or enable one at the dashboard (/)")
+            return self._error(502, "upstream unreachable: %s" % exc)
+        with upstream:
+            if want_stream:
+                return self._messages_stream_response(upstream, model, fp, account, t_start)
+            try:
+                result = aggregate_stream(upstream, model, None)
+            except Exception as exc:
+                return self._error(502, "upstream stream error: %s" % exc)
+        wall = int((time.time() - t_start) * 1000)
+        first_at = result.get("first_chunk_at")
+        first_ms = int((first_at - t_start) * 1000) if first_at else None
+        record_usage(model, result.get("usage"), stream=False, elapsed_ms=wall,
+                     ttft_ms=first_ms, gen_ms=(wall - first_ms) if first_ms is not None else None,
+                     fp=fp, account=account.uid)
+        return self._json(200, chat_to_messages(result, model))
+
+    def _messages_stream_response(self, upstream, model, fp, account, t_start):
+        """Emit Anthropic SSE events after translating the upstream chat stream."""
+        try:
+            result = aggregate_stream(upstream, model, None)
+        except Exception as exc:
+            return self._error(502, "upstream stream error: %s" % exc)
+        message = chat_to_messages(result, model)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        def emit(event, data):
+            self.wfile.write(("event: %s\n" % event).encode("utf-8"))
+            self.wfile.write(("data: %s\n\n" % json.dumps(data, ensure_ascii=False)).encode("utf-8"))
+            self.wfile.flush()
+        emit("message_start", {"type": "message_start", "message": dict(message, content=[])})
+        for index, block in enumerate(message["content"]):
+            emit("content_block_start", {"type": "content_block_start", "index": index,
+                                         "content_block": dict(block, text="" if block["type"] == "text" else block)})
+            if block["type"] == "text":
+                emit("content_block_delta", {"type": "content_block_delta", "index": index,
+                                             "delta": {"type": "text_delta", "text": block["text"]}})
+            emit("content_block_stop", {"type": "content_block_stop", "index": index})
+        emit("message_delta", {"type": "message_delta",
+                               "delta": {"stop_reason": message["stop_reason"], "stop_sequence": None},
+                               "usage": {"output_tokens": message["usage"]["output_tokens"]}})
+        emit("message_stop", {"type": "message_stop"})
+        wall = int((time.time() - t_start) * 1000)
+        record_usage(model, result.get("usage"), stream=True, elapsed_ms=wall,
+                     fp=fp, account=account.uid)
+        return
+
     def _responses_stream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -6752,7 +6987,8 @@ class Handler(BaseHTTPRequestHandler):
         )
         if not is_account_route and path not in ("/v1/chat/completions", "/chat/completions",
                                                 "/v1/completions", "/completions",
-                                                "/v1/responses", "/responses"):
+                                                "/v1/responses", "/responses",
+                                                "/v1/messages", "/messages"):
             return self._error(404, "not found", "invalid_request_error")
         if not self._authorized():
             return
@@ -6787,6 +7023,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
+        if path in ("/v1/messages", "/messages"):
+            return self._handle_messages(payload)
         # Diagnostics: what the client actually asked for, and what we forward.
         # Only the knobs that change behaviour are logged - never message text.
         forwarded = build_upstream_body(payload)

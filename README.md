@@ -227,6 +227,7 @@ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 | GET | / | Web 用量与任务监控看板 |
 | POST | /v1/chat/completions | 标准 Chat Completions 接口 |
 | POST | /v1/responses | Responses API 协议接口 |
+| POST | /v1/messages | Anthropic Messages API 协议接口（含工具与 SSE） |
 | GET | /v1/models | 官方对齐模型列表（含能力与规格宣告） |
 | GET | /tasks | 国内版成长任务、连续打卡与猫猫日常状态 |
 | POST | /tasks/run | 触发国内成长任务全自动点亮与领奖 |
