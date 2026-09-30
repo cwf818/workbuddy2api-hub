@@ -2403,7 +2403,9 @@ def has_fingerprint(text):
     for f in SANITIZE_FEATURES:
         if f in text:
             return True
-    return bool(SANITIZE_BARE_HDR_RE.search(text) or SANITIZE_OMO_JUNIOR_RE.search(text))
+    return bool(SANITIZE_BARE_HDR_RE.search(text)
+                or SANITIZE_KV_RE.search(text)
+                or SANITIZE_OMO_JUNIOR_RE.search(text))
 def sanitize_text(text):
     if not isinstance(text, str) or not text:
         return text

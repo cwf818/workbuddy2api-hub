@@ -69,7 +69,7 @@ dirty = P.messages_to_chat({
         }]},
         {"role": "user", "content": [{
             "type": "tool_result", "tool_use_id": "toolu_hidden",
-            "content": "cc_entrypoint=claude; " + fingerprint,
+            "content": "cc_entrypoint=claude; cc_version=2.0.0; " + fingerprint,
         }]},
     ],
 })
@@ -83,6 +83,8 @@ check("Anthropic billing header fingerprint is removed from tool arguments",
       "x-anthropic-billing-header" not in serialized)
 check("Claude Code entrypoint marker is removed from tool results",
       "cc_entrypoint=" not in serialized)
+check("Claude Code version marker is removed when it is the only fingerprint",
+      P.sanitize_text("cc_version=2.0.0") == "")
 
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
