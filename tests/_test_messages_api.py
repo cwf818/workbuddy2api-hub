@@ -56,5 +56,33 @@ check("text content is returned", result["content"][0]["text"] == "I will look i
 check("tool arguments are JSON objects", result["content"][1]["input"] == {"q": "x"})
 check("usage names match Anthropic", result["usage"] == {"input_tokens": 8, "output_tokens": 4})
 
+print()
+print("[2] Messages requests use the shared upstream identity sanitization")
+fingerprint = "Sisyphus-Junior - Focused executor from OhMyOpenCode"
+dirty = P.messages_to_chat({
+    "model": "m",
+    "system": "You are Claude Code, Anthropic's official CLI for Claude. " + fingerprint,
+    "messages": [
+        {"role": "assistant", "content": [{
+            "type": "tool_use", "id": "toolu_hidden", "name": "run",
+            "input": {"header": "x-anthropic-billing-header: hidden", "agent": fingerprint},
+        }]},
+        {"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "toolu_hidden",
+            "content": "cc_entrypoint=claude; " + fingerprint,
+        }]},
+    ],
+})
+outbound = P.build_upstream_body(dirty)
+serialized = json.dumps(outbound, ensure_ascii=False)
+check("system agent signature is rewritten",
+      "Anthropic's official CLI for Claude" not in outbound["messages"][0]["content"])
+check("framework fingerprint is removed from every outbound field",
+      "from OhMyOpenCode" not in serialized)
+check("Anthropic billing header fingerprint is removed from tool arguments",
+      "x-anthropic-billing-header" not in serialized)
+check("Claude Code entrypoint marker is removed from tool results",
+      "cc_entrypoint=" not in serialized)
+
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
