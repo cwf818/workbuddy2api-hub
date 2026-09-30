@@ -104,14 +104,15 @@ class CaptureMessagesStream:
 
 captured = CaptureMessagesStream()
 saved_record_usage = P.record_usage
-P.record_usage = lambda *_args, **_kwargs: None
+usage_records = []
+P.record_usage = lambda *_args, **kwargs: usage_records.append(kwargs)
 try:
     P.Handler._messages_stream_response(captured, iter([
         chunk({"tool_calls": [{"index": 0, "id": "call_read",
                                "function": {"name": "Read",
                                             "arguments": '{"file_path":"C:/repo/a.py"}'}}]},
               "tool_calls"),
-    ]), "m", None, SimpleNamespace(uid="test-account"), 0)
+    ]), "m", None, SimpleNamespace(uid="test-account"), P.time.time() - 0.01)
 finally:
     P.record_usage = saved_record_usage
 
@@ -131,6 +132,10 @@ check("tool-use start event has an empty input object",
 check("tool-use JSON delta carries file_path",
       json.loads(tool_delta["delta"]["partial_json"]) == {"file_path": "C:/repo/a.py"},
       tool_delta)
+check("stream usage records time to first chunk and generation duration",
+      bool(usage_records) and usage_records[0].get("ttft_ms") is not None
+      and usage_records[0].get("gen_ms") is not None,
+      usage_records)
 
 print()
 print("[3] Messages requests use the shared upstream identity sanitization")

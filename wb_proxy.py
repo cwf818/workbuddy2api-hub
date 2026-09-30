@@ -6880,7 +6880,11 @@ class Handler(BaseHTTPRequestHandler):
                                "usage": {"output_tokens": message["usage"]["output_tokens"]}})
         emit("message_stop", {"type": "message_stop"})
         wall = int((time.time() - t_start) * 1000)
+        first_at = result.get("first_chunk_at")
+        first_ms = int((first_at - t_start) * 1000) if first_at else None
         record_usage(model, result.get("usage"), stream=True, elapsed_ms=wall,
+                     ttft_ms=first_ms,
+                     gen_ms=(wall - first_ms) if first_ms is not None else None,
                      fp=fp, account=account.uid)
         return
 
