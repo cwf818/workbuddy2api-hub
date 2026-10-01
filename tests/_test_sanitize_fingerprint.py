@@ -47,6 +47,11 @@ class FingerprintSanitizationTests(unittest.TestCase):
         self.assertEqual(P.sanitize_text(phrase), "You are a coding agent")
         self.assertEqual(P.sanitize_text(phrase.lower()), "You are a coding agent")
 
+    def test_claude_code_agent_identity_is_neutralized(self):
+        phrase = "You are an agent for Claude Code, Anthropic's official CLI for Claude"
+        self.assertEqual(P.sanitize_text(phrase), "You are a coding agent")
+        self.assertEqual(P.sanitize_text(phrase.lower()), "You are a coding agent")
+
     def test_sanitize_messages_covers_all_roles_and_tool_args(self):
         fp = "Sisyphus-Junior - Focused executor from OhMyOpenCode"
         clean = "Sisyphus-Junior - Focused executor"

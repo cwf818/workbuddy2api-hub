@@ -2371,6 +2371,7 @@ SANITIZE_FEATURES = (
     "You are Claude Code",
     "A user kicked off a Claude Code agent to do a coding task and walked away",
     "You are a Claude agent, built on Anthropic's Claude Agent SDK",
+    "You are an agent for Claude Code, Anthropic's official CLI for Claude",
     "Main branch (",
     "You are a coding agent running in the Codex CLI",
     "github.com/anthropics/",
@@ -2407,6 +2408,10 @@ SANITIZE_CLAUDE_SDK_RE = re.compile(
     r"You are a Claude agent, built on Anthropic's Claude Agent SDK",
     re.IGNORECASE,
 )
+SANITIZE_CLAUDE_CODE_AGENT_RE = re.compile(
+    r"You are an agent for Claude Code, Anthropic's official CLI for Claude",
+    re.IGNORECASE,
+)
 def has_fingerprint(text):
     if not isinstance(text, str) or not text:
         return False
@@ -2417,7 +2422,8 @@ def has_fingerprint(text):
                 or SANITIZE_KV_RE.search(text)
                 or SANITIZE_OMO_JUNIOR_RE.search(text)
                 or SANITIZE_CLAUDE_AGENT_RE.search(text)
-                or SANITIZE_CLAUDE_SDK_RE.search(text))
+                or SANITIZE_CLAUDE_SDK_RE.search(text)
+                or SANITIZE_CLAUDE_CODE_AGENT_RE.search(text))
 def sanitize_text(text):
     if not isinstance(text, str) or not text:
         return text
@@ -2431,6 +2437,7 @@ def sanitize_text(text):
     text = SANITIZE_CLAUDE_AGENT_RE.sub(
         "A user kicked off a coding task and walked away", text)
     text = SANITIZE_CLAUDE_SDK_RE.sub("You are a coding agent", text)
+    text = SANITIZE_CLAUDE_CODE_AGENT_RE.sub("You are a coding agent", text)
     for old, new in SANITIZE_REWRITES:
         text = text.replace(old, new)
     text = SANITIZE_HDR_RE.sub("", text)
