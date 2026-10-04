@@ -46,6 +46,64 @@ check("any tool choice becomes required", chat.get("tool_choice") == "required")
 check("tool-use IDs survive", chat["messages"][1]["tool_calls"][0]["id"] == "toolu_1")
 check("tool results become OpenAI tool messages", chat["messages"][2]["tool_call_id"] == "toolu_1")
 
+print()
+print("[1a] tool-result images stay structured instead of entering tool text as base64")
+image_data = "image-base64-sentinel"
+image_chat = P.messages_to_chat({
+    "model": "m",
+    "messages": [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_image",
+                                            "name": "view_image", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_image",
+                                       "content": [{"type": "image", "source": {
+                                           "type": "base64", "media_type": "image/png",
+                                           "data": image_data,
+                                       }}]}]},
+    ],
+})
+tool_image_result = image_chat["messages"][1]
+image_followup = image_chat["messages"][2]
+check("tool-result image bytes are not embedded in the tool message",
+      image_data not in tool_image_result["content"], tool_image_result)
+check("image-only tool result gets a safe placeholder",
+      tool_image_result["content"] == "[image]", tool_image_result)
+check("tool-result image is forwarded as a user image_url part",
+      image_followup["role"] == "user"
+      and any(part.get("type") == "image_url"
+              and part.get("image_url", {}).get("url", "").endswith(image_data)
+              for part in image_followup["content"]),
+      image_followup)
+forwarded_image_chat = P.build_upstream_body(image_chat)
+forwarded_tool_result = next(m for m in forwarded_image_chat["messages"]
+                             if m.get("role") == "tool")
+forwarded_image = next(m for m in forwarded_image_chat["messages"]
+                       if m.get("role") == "user")
+check("upstream-body construction keeps tool images out of tool text",
+      image_data not in forwarded_tool_result["content"])
+check("upstream-body construction preserves the native image part",
+      any(part.get("type") == "image_url"
+          and part.get("image_url", {}).get("url", "").endswith(image_data)
+          for part in forwarded_image["content"]))
+
+mixed_image_chat = P.messages_to_chat({
+    "model": "m",
+    "messages": [{"role": "user", "content": [{
+        "type": "tool_result", "tool_use_id": "toolu_mixed",
+        "content": [
+            {"type": "text", "text": "Tool found this screenshot."},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": image_data,
+            }},
+        ],
+    }]}],
+})
+check("text accompanying a tool-result image is retained",
+      mixed_image_chat["messages"][0]["content"] == "Tool found this screenshot.")
+check("mixed tool-result image is still forwarded separately as media",
+      mixed_image_chat["messages"][1]["role"] == "user"
+      and any(part.get("type") == "image_url"
+              for part in mixed_image_chat["messages"][1]["content"]))
+
 result = P.chat_to_messages({
     "choices": [{"finish_reason": "tool_calls", "message": {
         "content": "I will look it up.",

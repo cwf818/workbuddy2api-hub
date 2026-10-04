@@ -3642,6 +3642,19 @@ def _anthropic_text(content):
     )
 
 
+def _anthropic_image_part(source):
+    """Translate an Anthropic base64 image source into an OpenAI image part."""
+    if not isinstance(source, dict):
+        return None
+    if source.get("type") == "base64" and source.get("data"):
+        mime = source.get("media_type") or "image/png"
+        return {
+            "type": "image_url",
+            "image_url": {"url": "data:%s;base64,%s" % (mime, source["data"])},
+        }
+    return None
+
+
 def messages_to_chat(payload):
     """Translate a stateless Anthropic Messages request into Chat Completions."""
     messages = []
@@ -3660,7 +3673,7 @@ def messages_to_chat(payload):
             continue
         if not isinstance(content, list):
             continue
-        text_parts, image_parts, tool_calls = [], [], []
+        text_parts, image_parts, tool_calls, tool_result_images = [], [], [], []
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -3670,13 +3683,9 @@ def messages_to_chat(payload):
             elif kind == "thinking" and role == "assistant":
                 text_parts.append(str(block.get("thinking") or ""))
             elif kind == "image" and role == "user":
-                source_data = block.get("source") or {}
-                if source_data.get("type") == "base64" and source_data.get("data"):
-                    mime = source_data.get("media_type") or "image/png"
-                    image_parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": "data:%s;base64,%s" % (mime, source_data["data"])},
-                    })
+                image_part = _anthropic_image_part(block.get("source"))
+                if image_part:
+                    image_parts.append(image_part)
             elif kind == "tool_use" and role == "assistant":
                 tool_calls.append({
                     "id": block.get("id") or _new_id("call_"),
@@ -3687,21 +3696,41 @@ def messages_to_chat(payload):
                     },
                 })
             elif kind == "tool_result" and role == "user":
-                result = _anthropic_text(block.get("content"))
-                if not result and block.get("content") is not None:
-                    result = str(block.get("content"))
+                result_content = block.get("content")
+                result = _anthropic_text(result_content)
+                result_images = []
+                if isinstance(result_content, list):
+                    for result_block in result_content:
+                        if isinstance(result_block, dict) and result_block.get("type") == "image":
+                            image_part = _anthropic_image_part(result_block.get("source"))
+                            if image_part:
+                                result_images.append(image_part)
+                if not result and result_content is not None:
+                    result = "[image]" if result_images else str(result_content)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": block.get("tool_use_id") or "",
                     "content": result,
                 })
-        if text_parts or image_parts or tool_calls:
+                if result_images:
+                    tool_result_images.append((block.get("tool_use_id"), result_images))
+        if text_parts or image_parts or tool_calls or tool_result_images:
             message = {
                 "role": role,
                 "content": image_parts or "\n".join(p for p in text_parts if p),
             }
-            if image_parts and text_parts:
-                message["content"] = [{"type": "text", "text": "\n".join(text_parts)}] + image_parts
+            if role == "user" and (image_parts or tool_result_images):
+                content_parts = []
+                if text_parts:
+                    content_parts.append({"type": "text", "text": "\n".join(text_parts)})
+                content_parts.extend(image_parts)
+                for tool_use_id, result_images in tool_result_images:
+                    label = "[tool_result image]"
+                    if tool_use_id:
+                        label = "[tool_result %s image]" % tool_use_id
+                    content_parts.append({"type": "text", "text": label})
+                    content_parts.extend(result_images)
+                message["content"] = content_parts
             if tool_calls:
                 message["tool_calls"] = tool_calls
             messages.append(message)
