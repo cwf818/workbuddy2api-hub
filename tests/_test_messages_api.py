@@ -146,6 +146,7 @@ check("malformed tool arguments fail explicitly instead of becoming empty input"
 
 class CaptureMessagesStream:
     path = "/v1/messages"
+    _key_id = lambda self: "test-key"
 
     def __init__(self):
         self.wfile = BytesIO()

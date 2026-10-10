@@ -13290,8 +13290,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_messages_feature(self, payload):
         """Serve Anthropic's stateless /v1/messages API through the chat upstream."""
-        chat_req = messages_to_chat_feature(payload)
-        model = payload.get("model") or "hy4-preview"
+        try:
+            chat_req = messages_to_chat_feature(payload)
+        except ValueError as exc:
+            return self._anthropic_error(400, str(exc), "invalid_request_error")
+        model = chat_req.get("model") or "unknown"
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
@@ -13299,63 +13302,93 @@ class Handler(BaseHTTPRequestHandler):
             req_realm = self._request_realm() or CURRENT_REALM
             blocked = self._cross_realm_error(model, req_realm)
             if blocked:
-                return self._error(400, blocked, "invalid_request_error")
+                return self._anthropic_error(400, blocked, "invalid_request_error")
             banned = self._banned_model_error(model)
             if banned:
-                return self._error(400, banned, "invalid_request_error")
+                return self._anthropic_error(400, banned, "invalid_request_error")
             key_blocked = self._key_model_error(model)
             if key_blocked:
-                return self._error(400, key_blocked, "invalid_request_error")
-            upstream, account, _effort = open_upstream(
+                return self._anthropic_error(400, key_blocked, "invalid_request_error")
+            upstream, account, effort = open_upstream(
                 chat_req, session_key=extract_session_key(self.headers, payload),
                 target_realm=req_realm)
         except ContentRejected as exc:
-            return self._error(403, "upstream 403: %s" % (exc.detail or "content rejected"),
-                               "invalid_request_error")
+            record_error(model, 403, exc.detail[:200],
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=getattr(exc, "account_uid", None), key=self._key_id())
+            return self._anthropic_error(
+                403, "upstream 403: %s" % (exc.detail or "content rejected"),
+                "permission_error")
         except RateLimited as exc:
-            return self._rate_limited(exc)
+            record_error(model, 429, exc.detail[:200],
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=getattr(exc, "account_uid", None), key=self._key_id())
+            return self._anthropic_rate_limited(exc)
         except urllib.error.HTTPError as exc:
-            return self._error(exc.code, "upstream %d: %s" %
-                               (exc.code, exc.read(600).decode("utf-8", "replace")))
+            try:
+                detail = exc.read(600).decode("utf-8", "replace")
+            except Exception:
+                detail = str(exc)
+            record_error(model, exc.code, detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=getattr(exc, "account_uid", None), key=self._key_id())
+            return self._anthropic_error(exc.code, "upstream %s: %s" %
+                                         (exc.code, detail))
         except Exception as exc:
             message = str(exc)
-            if message.startswith("no usable account"):
-                return self._error(503, message + " - add or enable one at the dashboard (/)")
-            return self._error(502, "upstream unreachable: %s" % exc)
+            status = (503 if "no account" in message.lower()
+                      or "no enabled account" in message.lower() else 502)
+            record_error(model, status, message,
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=getattr(exc, "account_uid", None), key=self._key_id())
+            if status == 503:
+                message += " - add or enable one at the dashboard (/)"
+            return self._anthropic_error(status, message)
         with upstream:
             if want_stream:
                 return self._messages_stream_response_feature(
-                    upstream, model, fp, account, t_start)
-            try:
-                result = aggregate_stream(upstream, model, None)
-            except Exception as exc:
-                return self._error(502, "upstream stream error: %s" % exc)
-        wall = int((time.time() - t_start) * 1000)
-        first_at = result.get("first_chunk_at")
-        first_ms = int((first_at - t_start) * 1000) if first_at else None
-        try:
-            response = chat_to_messages_feature(result, model)
-        except ValueError as exc:
-            record_error(model, 502, str(exc), elapsed_ms=wall, account=account.uid)
-            return self._error(502, str(exc), "server_error")
-        record_usage(model, result.get("usage"), stream=False, elapsed_ms=wall,
-                     ttft_ms=first_ms, gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid)
-        return self._json(200, response)
+                    upstream, model, fp, account, t_start, effort=effort)
+            return self._messages_nonstream_response_feature(
+                upstream, model, fp, account, t_start, effort=effort)
 
-    def _messages_stream_response_feature(self, upstream, model, fp, account, t_start):
+    def _messages_nonstream_response_feature(self, upstream, model, fp, account, t_start,
+                                             effort=None):
+        try:
+            result = aggregate_stream(upstream, model, None)
+            response = chat_to_messages_feature(result, model)
+            wall = int((time.time() - t_start) * 1000)
+            record_usage(model, result.get("usage"), stream=False, elapsed_ms=wall,
+                         fp=fp, account=account.uid, key=self._key_id(), effort=effort)
+            return self._json(200, response)
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "messages upstream error: %s" % exc,
+                         elapsed_ms=wall, account=account.uid, key=self._key_id())
+            return self._anthropic_error(502, "upstream stream error: %s" % exc)
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    def _messages_stream_response_feature(self, upstream, model, fp, account, t_start,
+                                          effort=None):
         """Emit Anthropic SSE events after translating the upstream chat stream."""
         try:
             result = aggregate_stream(upstream, model, None)
         except Exception as exc:
-            return self._error(502, "upstream stream error: %s" % exc)
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "messages stream error: %s" % exc,
+                         elapsed_ms=wall, account=account.uid, stream=True,
+                         fp=fp, key=self._key_id())
+            return self._anthropic_error(502, "upstream stream error: %s" % exc)
         try:
             message = chat_to_messages_feature(result, model)
         except ValueError as exc:
-            record_error(model, 502, str(exc),
-                         elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=account.uid)
-            return self._error(502, str(exc), "server_error")
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, str(exc), elapsed_ms=wall, account=account.uid,
+                         stream=True, fp=fp, key=self._key_id())
+            return self._anthropic_error(502, str(exc), "api_error")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -13367,46 +13400,67 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(("event: %s\n" % event).encode("utf-8"))
             self.wfile.write(("data: %s\n\n" % json.dumps(data, ensure_ascii=False)).encode("utf-8"))
             self.wfile.flush()
-        emit("message_start", {"type": "message_start", "message": dict(message, content=[])})
-        for index, block in enumerate(message["content"]):
-            if block["type"] == "text":
-                start_block = dict(block, text="")
-            elif block["type"] == "tool_use":
-                # Anthropic clients build tool input exclusively from
-                # input_json_delta events. Supplying it only in the start
-                # event looks valid on the wire but is interpreted as {} by
-                # Claude Code, causing required parameters such as file_path
-                # and command to appear missing.
-                start_block = dict(block, input={})
-            else:
-                start_block = block
-            emit("content_block_start", {"type": "content_block_start", "index": index,
-                                         "content_block": start_block})
-            if block["type"] == "text":
-                emit("content_block_delta", {"type": "content_block_delta", "index": index,
-                                             "delta": {"type": "text_delta", "text": block["text"]}})
-            elif block["type"] == "tool_use":
-                emit("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": json.dumps(block["input"], ensure_ascii=False,
-                                                   separators=(",", ":")),
-                    },
-                })
-            emit("content_block_stop", {"type": "content_block_stop", "index": index})
-        emit("message_delta", {"type": "message_delta",
-                               "delta": {"stop_reason": message["stop_reason"], "stop_sequence": None},
-                               "usage": {"output_tokens": message["usage"]["output_tokens"]}})
-        emit("message_stop", {"type": "message_stop"})
-        wall = int((time.time() - t_start) * 1000)
         first_at = result.get("first_chunk_at")
         first_ms = int((first_at - t_start) * 1000) if first_at else None
+        try:
+            emit("message_start", {"type": "message_start",
+                                   "message": dict(message, content=[])})
+            for index, block in enumerate(message["content"]):
+                if block["type"] == "text":
+                    start_block = dict(block, text="")
+                elif block["type"] == "tool_use":
+                    # Clients build tool input from input_json_delta events.
+                    start_block = dict(block, input={})
+                else:
+                    start_block = block
+                emit("content_block_start", {"type": "content_block_start", "index": index,
+                                             "content_block": start_block})
+                if block["type"] == "text":
+                    emit("content_block_delta", {
+                        "type": "content_block_delta", "index": index,
+                        "delta": {"type": "text_delta", "text": block["text"]}})
+                elif block["type"] == "tool_use":
+                    emit("content_block_delta", {
+                        "type": "content_block_delta", "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(block["input"], ensure_ascii=False,
+                                                       separators=(",", ":")),
+                        },
+                    })
+                emit("content_block_stop", {"type": "content_block_stop", "index": index})
+            emit("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": message["stop_reason"], "stop_sequence": None},
+                "usage": {"output_tokens": message["usage"]["output_tokens"]},
+            })
+            emit("message_stop", {"type": "message_stop"})
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            wall = int((time.time() - t_start) * 1000)
+            record_usage(model, result.get("usage"), stream=True, elapsed_ms=wall,
+                         ttft_ms=first_ms,
+                         gen_ms=(wall - first_ms) if first_ms is not None else None,
+                         fp=fp, account=account.uid, outcome="client_aborted",
+                         key=self._key_id(), effort=effort)
+            return
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "messages stream aborted: %s" % exc,
+                         elapsed_ms=wall, account=account.uid, usage=result.get("usage"),
+                         stream=True, ttft_ms=first_ms, fp=fp,
+                         outcome="upstream_aborted", key=self._key_id())
+            try:
+                self.wfile.write(anthropic_sse_frame("error", {
+                    "error": {"type": "api_error", "message": str(exc)}}))
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
+        wall = int((time.time() - t_start) * 1000)
         record_usage(model, result.get("usage"), stream=True, elapsed_ms=wall,
                      ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid)
+                     fp=fp, account=account.uid, key=self._key_id(), effort=effort)
         return
 
     def _responses_stream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None):

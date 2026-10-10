@@ -411,9 +411,14 @@ try:
     check("usage.jsonl has rows", len(rows) >= 2, len(rows))
     check("rows carry the model",
           any(r.get("model") == "deepseek-v4.1-flash" for r in rows), rows[-2:])
+    check("usage rows carry API-key attribution",
+          any("key" in r for r in rows), rows[-2:])
     stream_rows = [r for r in rows if r.get("stream") and r.get("outcome") == "completed"]
     check("streamed messages record upstream tokens",
           any((r.get("prompt_tokens") or 0) == 11 and (r.get("completion_tokens") or 0) == 2
+              for r in stream_rows), stream_rows[-3:])
+    check("streamed messages record upstream timing",
+          any(r.get("ttft_ms") is not None and r.get("gen_ms") is not None
               for r in stream_rows), stream_rows[-3:])
     check("streamed messages record cache hits",
           any((r.get("cached_tokens") or 0) == 3 for r in stream_rows), stream_rows[-3:])
