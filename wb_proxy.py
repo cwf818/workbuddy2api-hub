@@ -5696,6 +5696,7 @@ def log(msg, level=None, tag=None):
     sys.stderr.flush()
     add_log_entry(msg, level=level, tag=tag)
 
+
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
     with _LOG_LOCK:
         items = list(LOG_BUFFER)
@@ -8379,6 +8380,50 @@ def _anthropic_image_part_feature(source):
     return None
 
 
+def _upstream_effort_for_model(model, requested):
+    reasoning = model_reasoning_meta(model)
+    if model_fixed_effort(model):
+        return None
+    supported = reasoning.get("supportedEfforts")
+    if not isinstance(supported, list):
+        return requested
+    choices = {
+        value.strip().lower(): value
+        for value in supported
+        if isinstance(value, str) and value.strip()
+    }
+    if not choices:
+        return requested
+    value = requested.strip().lower()
+    if value in choices:
+        return choices[value]
+    aliases = {
+        "minimal": "low",
+        "medium": "high",
+        "xhigh": "high",
+        "ultra": "max",
+    }
+    mapped = aliases.get(value)
+    if mapped in choices:
+        return choices[mapped]
+    ranks = {
+        "minimal": 0,
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+        "xhigh": 4,
+        "max": 5,
+        "ultra": 6,
+    }
+    if value not in ranks:
+        return None
+    ranked_choices = [(rank, canonical) for level, canonical in choices.items()
+                      if (rank := ranks.get(level)) is not None]
+    if not ranked_choices:
+        return None
+    return min(ranked_choices, key=lambda item: (abs(item[0] - ranks[value]), -item[0]))[1]
+
+
 def messages_to_chat_feature(payload):
     """Translate a stateless Anthropic Messages request into Chat Completions."""
     messages = []
@@ -8465,6 +8510,7 @@ def messages_to_chat_feature(payload):
             chat[key] = payload[key]
     if payload.get("max_tokens") is not None:
         chat["max_tokens"] = payload["max_tokens"]
+    _apply_anthropic_effort(chat, payload)
     tools = []
     for tool in payload.get("tools") or []:
         if not isinstance(tool, dict) or not tool.get("name"):
@@ -9561,6 +9607,26 @@ def anthropic_effort_from_messages(payload):
     return "low"
 
 
+def _apply_anthropic_effort(chat, payload):
+    effort = anthropic_effort_from_messages(payload)
+    if not effort:
+        return
+    model = str(chat.get("model") or "")
+    if model_fixed_effort(model):
+        return
+    if effort.strip().lower() == "none":
+        reasoning = model_reasoning_meta(model)
+        if (model.lower().startswith("deepseek")
+                and reasoning.get("canDisableThinking") is not False):
+            chat["thinking"] = {"type": "disabled"}
+        elif not model.lower().startswith("deepseek"):
+            chat["reasoning_effort"] = "none"
+        return
+    upstream_effort = _upstream_effort_for_model(model, effort)
+    if upstream_effort:
+        chat["reasoning_effort"] = upstream_effort
+
+
 def _anthropic_blocks_to_messages(role, blocks):
     tool_calls = []
     tool_messages = []
@@ -9660,9 +9726,7 @@ def messages_to_chat(payload):
     raw_choice = payload.get("tool_choice")
     if isinstance(raw_choice, dict) and raw_choice.get("disable_parallel_tool_use") is True:
         chat["parallel_tool_calls"] = False
-    effort = anthropic_effort_from_messages(payload)
-    if effort:
-        chat["reasoning_effort"] = effort
+    _apply_anthropic_effort(chat, payload)
     messages = []
     system = _anthropic_system_text(payload.get("system"))
     if skipped:
