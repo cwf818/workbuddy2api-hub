@@ -6466,6 +6466,9 @@ SANITIZE_FEATURES = (
     "x-anthropic-billing-header",
     "cc_entrypoint=",
     "You are Claude Code",
+    "A user kicked off a Claude Code agent to do a coding task and walked away",
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK",
+    "You are an agent for Claude Code, Anthropic's official CLI for Claude",
     "Main branch (",
     "You are a coding agent running in the Codex CLI",
     "github.com/anthropics/",
@@ -6514,6 +6517,18 @@ SANITIZE_BARE_HDR_LOWER = SANITIZE_BARE_HDR_RE.pattern
 if SANITIZE_BARE_HDR_LOWER.startswith("(?i)"):
     SANITIZE_BARE_HDR_LOWER = SANITIZE_BARE_HDR_LOWER[4:]
 SANITIZE_OMO_JUNIOR_LOWER = SANITIZE_OMO_JUNIOR_RE.pattern.lower()
+SANITIZE_CLAUDE_AGENT_RE = re.compile(
+    r"A user kicked off a Claude Code agent to do a coding task and walked away",
+    re.IGNORECASE,
+)
+SANITIZE_CLAUDE_SDK_RE = re.compile(
+    r"You are a Claude agent, built on Anthropic's Claude Agent SDK",
+    re.IGNORECASE,
+)
+SANITIZE_CLAUDE_CODE_AGENT_RE = re.compile(
+    r"You are an agent for Claude Code, Anthropic's official CLI for Claude",
+    re.IGNORECASE,
+)
 def has_fingerprint(text):
     if not isinstance(text, str) or not text:
         return False
@@ -6526,7 +6541,15 @@ def has_fingerprint(text):
         low = text.translate(SANITIZE_REI_FOLD).lower()
     else:
         low = text.lower()
-    return SANITIZE_BARE_HDR_LOWER in low or SANITIZE_OMO_JUNIOR_LOWER in low
+    if SANITIZE_BARE_HDR_LOWER in low or SANITIZE_OMO_JUNIOR_LOWER in low:
+        return True
+    if "cc_" in low and SANITIZE_KV_RE.search(text):
+        return True
+    return (
+        ("a user kicked off a claude code agent to do a coding task and walked away" in low)
+        or ("you are a claude agent, built on anthropic's claude agent sdk" in low)
+        or ("you are an agent for claude code, anthropic's official cli for claude" in low)
+    )
 def sanitize_text(text):
     if not isinstance(text, str) or not text:
         return text
@@ -6537,10 +6560,14 @@ def sanitize_text(text):
     # accepted by the upstream. Only the confirmed contiguous fingerprint is
     # neutralized.
     text = SANITIZE_OMO_JUNIOR_RE.sub("Sisyphus-Junior - Focused executor", text)
+    text = SANITIZE_CLAUDE_AGENT_RE.sub(
+        "A user kicked off a coding task and walked away", text)
+    text = SANITIZE_CLAUDE_SDK_RE.sub("You are a coding agent", text)
+    text = SANITIZE_CLAUDE_CODE_AGENT_RE.sub("You are a coding agent", text)
     for old, new in SANITIZE_REWRITES:
         text = text.replace(old, new)
     text = SANITIZE_HDR_RE.sub("", text)
-    if "cc_" in text:
+    if "cc_" in text.lower():
         prev = ""
         while prev != text:
             prev = text
@@ -8319,6 +8346,190 @@ def aggregate_stream(raw_iter, model, resp_id):
     out["elapsed_ms"] = int((time.time() - started) * 1000)
     out["first_chunk_at"] = first_chunk_at
     return out
+# ---------------------------------------------------------------------------
+# Anthropic Messages API (/v1/messages) <-> Chat Completions translation
+# ---------------------------------------------------------------------------
+#
+# Claude Code and the Anthropic SDK speak Messages rather than OpenAI's Chat
+# Completions format.  Keep this adapter next to the Responses adapter: both
+# deliberately translate at the edge and share the same upstream/account path.
+def _anthropic_text_feature(content):
+    """Extract text from an Anthropic content value without losing text blocks."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(block.get("text") or block.get("thinking") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") in ("text", "thinking")
+    )
+
+
+def _anthropic_image_part_feature(source):
+    """Translate an Anthropic base64 image source into an OpenAI image part."""
+    if not isinstance(source, dict):
+        return None
+    if source.get("type") == "base64" and source.get("data"):
+        mime = source.get("media_type") or "image/png"
+        return {
+            "type": "image_url",
+            "image_url": {"url": "data:%s;base64,%s" % (mime, source["data"])},
+        }
+    return None
+
+
+def messages_to_chat_feature(payload):
+    """Translate a stateless Anthropic Messages request into Chat Completions."""
+    messages = []
+    system = _anthropic_text_feature(payload.get("system"))
+    if system:
+        messages.append({"role": "system", "content": system})
+    for source in payload.get("messages") or []:
+        if not isinstance(source, dict):
+            continue
+        role = source.get("role")
+        content = source.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        text_parts, image_parts, tool_calls, tool_result_images = [], [], [], []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text":
+                text_parts.append(str(block.get("text") or ""))
+            elif kind == "thinking" and role == "assistant":
+                text_parts.append(str(block.get("thinking") or ""))
+            elif kind == "image" and role == "user":
+                image_part = _anthropic_image_part_feature(block.get("source"))
+                if image_part:
+                    image_parts.append(image_part)
+            elif kind == "tool_use" and role == "assistant":
+                tool_calls.append({
+                    "id": block.get("id") or _new_id("call_"),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name") or "",
+                        "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                    },
+                })
+            elif kind == "tool_result" and role == "user":
+                result_content = block.get("content")
+                result = _anthropic_text_feature(result_content)
+                result_images = []
+                if isinstance(result_content, list):
+                    for result_block in result_content:
+                        if isinstance(result_block, dict) and result_block.get("type") == "image":
+                            image_part = _anthropic_image_part_feature(
+                                result_block.get("source"))
+                            if image_part:
+                                result_images.append(image_part)
+                if not result and result_content is not None:
+                    result = "[image]" if result_images else str(result_content)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id") or "",
+                    "content": result,
+                })
+                if result_images:
+                    tool_result_images.append((block.get("tool_use_id"), result_images))
+        if text_parts or image_parts or tool_calls or tool_result_images:
+            message = {
+                "role": role,
+                "content": image_parts or "\n".join(p for p in text_parts if p),
+            }
+            if role == "user" and (image_parts or tool_result_images):
+                content_parts = []
+                if text_parts:
+                    content_parts.append({"type": "text", "text": "\n".join(text_parts)})
+                content_parts.extend(image_parts)
+                for tool_use_id, result_images in tool_result_images:
+                    label = "[tool_result image]"
+                    if tool_use_id:
+                        label = "[tool_result %s image]" % tool_use_id
+                    content_parts.append({"type": "text", "text": label})
+                    content_parts.extend(result_images)
+                message["content"] = content_parts
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            messages.append(message)
+    chat = {"model": payload.get("model"), "messages": messages}
+    for key in ("temperature", "top_p"):
+        if payload.get(key) is not None:
+            chat[key] = payload[key]
+    if payload.get("max_tokens") is not None:
+        chat["max_tokens"] = payload["max_tokens"]
+    tools = []
+    for tool in payload.get("tools") or []:
+        if not isinstance(tool, dict) or not tool.get("name"):
+            continue
+        tools.append({
+            "type": "function",
+            "name": tool["name"],
+            "description": tool.get("description") or "",
+            "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+        })
+    if tools:
+        chat["tools"] = tools
+    choice = payload.get("tool_choice")
+    if isinstance(choice, dict):
+        typ = choice.get("type")
+        if typ == "tool":
+            chat["tool_choice"] = (choice.get("name") or "auto")
+        elif typ in ("auto", "any", "none"):
+            chat["tool_choice"] = "required" if typ == "any" else typ
+    return chat
+
+
+def chat_to_messages_feature(chat_obj, model):
+    """Fold an aggregated Chat Completions response into an Anthropic message."""
+    choice = (chat_obj.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = []
+    # Anthropic's thinking blocks require a cryptographic signature produced by
+    # Anthropic. The upstream's reasoning trace has no compatible signature, so
+    # do not emit a syntactically invalid thinking block.
+    if message.get("content"):
+        content.append({"type": "text", "text": message["content"]})
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        name = fn.get("name") or ""
+        try:
+            tool_input = json.loads(fn.get("arguments") or "{}")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("upstream tool call %r emitted invalid JSON arguments" % name) from exc
+        if not isinstance(tool_input, dict):
+            raise ValueError("upstream tool call %r emitted non-object arguments" % name)
+        content.append({
+            "type": "tool_use",
+            "id": call.get("id") or _new_id("toolu_"),
+            "name": name,
+            "input": tool_input,
+        })
+    finish = choice.get("finish_reason") or "stop"
+    stop_reason = {"tool_calls": "tool_use", "length": "max_tokens"}.get(finish, "end_turn")
+    usage = chat_obj.get("usage") or {}
+    return {
+        "id": _new_id("msg_"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens") or 0,
+            "output_tokens": usage.get("completion_tokens") or 0,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Responses API (/v1/responses) <-> Chat Completions translation
 # ---------------------------------------------------------------------------
@@ -13028,6 +13239,127 @@ class Handler(BaseHTTPRequestHandler):
                 base_body=chat_req, session_key=session_key, realm=req_realm,
                 effort=effort)
 
+    def _handle_messages_feature(self, payload):
+        """Serve Anthropic's stateless /v1/messages API through the chat upstream."""
+        chat_req = messages_to_chat_feature(payload)
+        model = payload.get("model") or "hy4-preview"
+        want_stream = bool(payload.get("stream"))
+        t_start = time.time()
+        fp = prompt_fingerprint(chat_req.get("messages"))
+        try:
+            req_realm = self._request_realm() or CURRENT_REALM
+            blocked = self._cross_realm_error(model, req_realm)
+            if blocked:
+                return self._error(400, blocked, "invalid_request_error")
+            banned = self._banned_model_error(model)
+            if banned:
+                return self._error(400, banned, "invalid_request_error")
+            key_blocked = self._key_model_error(model)
+            if key_blocked:
+                return self._error(400, key_blocked, "invalid_request_error")
+            upstream, account, _effort = open_upstream(
+                chat_req, session_key=extract_session_key(self.headers, payload),
+                target_realm=req_realm)
+        except ContentRejected as exc:
+            return self._error(403, "upstream 403: %s" % (exc.detail or "content rejected"),
+                               "invalid_request_error")
+        except RateLimited as exc:
+            return self._rate_limited(exc)
+        except urllib.error.HTTPError as exc:
+            return self._error(exc.code, "upstream %d: %s" %
+                               (exc.code, exc.read(600).decode("utf-8", "replace")))
+        except Exception as exc:
+            message = str(exc)
+            if message.startswith("no usable account"):
+                return self._error(503, message + " - add or enable one at the dashboard (/)")
+            return self._error(502, "upstream unreachable: %s" % exc)
+        with upstream:
+            if want_stream:
+                return self._messages_stream_response_feature(
+                    upstream, model, fp, account, t_start)
+            try:
+                result = aggregate_stream(upstream, model, None)
+            except Exception as exc:
+                return self._error(502, "upstream stream error: %s" % exc)
+        wall = int((time.time() - t_start) * 1000)
+        first_at = result.get("first_chunk_at")
+        first_ms = int((first_at - t_start) * 1000) if first_at else None
+        try:
+            response = chat_to_messages_feature(result, model)
+        except ValueError as exc:
+            record_error(model, 502, str(exc), elapsed_ms=wall, account=account.uid)
+            return self._error(502, str(exc), "server_error")
+        record_usage(model, result.get("usage"), stream=False, elapsed_ms=wall,
+                     ttft_ms=first_ms, gen_ms=(wall - first_ms) if first_ms is not None else None,
+                     fp=fp, account=account.uid)
+        return self._json(200, response)
+
+    def _messages_stream_response_feature(self, upstream, model, fp, account, t_start):
+        """Emit Anthropic SSE events after translating the upstream chat stream."""
+        try:
+            result = aggregate_stream(upstream, model, None)
+        except Exception as exc:
+            return self._error(502, "upstream stream error: %s" % exc)
+        try:
+            message = chat_to_messages_feature(result, model)
+        except ValueError as exc:
+            record_error(model, 502, str(exc),
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=account.uid)
+            return self._error(502, str(exc), "server_error")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        def emit(event, data):
+            self.wfile.write(("event: %s\n" % event).encode("utf-8"))
+            self.wfile.write(("data: %s\n\n" % json.dumps(data, ensure_ascii=False)).encode("utf-8"))
+            self.wfile.flush()
+        emit("message_start", {"type": "message_start", "message": dict(message, content=[])})
+        for index, block in enumerate(message["content"]):
+            if block["type"] == "text":
+                start_block = dict(block, text="")
+            elif block["type"] == "tool_use":
+                # Anthropic clients build tool input exclusively from
+                # input_json_delta events. Supplying it only in the start
+                # event looks valid on the wire but is interpreted as {} by
+                # Claude Code, causing required parameters such as file_path
+                # and command to appear missing.
+                start_block = dict(block, input={})
+            else:
+                start_block = block
+            emit("content_block_start", {"type": "content_block_start", "index": index,
+                                         "content_block": start_block})
+            if block["type"] == "text":
+                emit("content_block_delta", {"type": "content_block_delta", "index": index,
+                                             "delta": {"type": "text_delta", "text": block["text"]}})
+            elif block["type"] == "tool_use":
+                emit("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(block["input"], ensure_ascii=False,
+                                                   separators=(",", ":")),
+                    },
+                })
+            emit("content_block_stop", {"type": "content_block_stop", "index": index})
+        emit("message_delta", {"type": "message_delta",
+                               "delta": {"stop_reason": message["stop_reason"], "stop_sequence": None},
+                               "usage": {"output_tokens": message["usage"]["output_tokens"]}})
+        emit("message_stop", {"type": "message_stop"})
+        wall = int((time.time() - t_start) * 1000)
+        first_at = result.get("first_chunk_at")
+        first_ms = int((first_at - t_start) * 1000) if first_at else None
+        record_usage(model, result.get("usage"), stream=True, elapsed_ms=wall,
+                     ttft_ms=first_ms,
+                     gen_ms=(wall - first_ms) if first_ms is not None else None,
+                     fp=fp, account=account.uid)
+        return
+
     def _responses_stream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -13414,7 +13746,7 @@ class Handler(BaseHTTPRequestHandler):
                              stream=payload.get("stream"), key=self._key_id())
                 return self._anthropic_error(503, message, "overloaded_error")
             try:
-                return self._handle_messages(payload)
+                return self._handle_messages_feature(payload)
             finally:
                 _chat_slots.release()
         # Both OpenAI-shaped routes below can hold a thread for up to 600s.
@@ -13443,6 +13775,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
+        if path in ("/v1/messages", "/messages"):
+            return self._handle_messages_feature(payload)
         # Diagnostics: what the client actually asked for, and what we forward.
         # Only the knobs that change behaviour are logged - never message text.
         forwarded = build_upstream_body(payload)
