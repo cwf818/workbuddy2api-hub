@@ -47,6 +47,53 @@ check("tool-use IDs survive", chat["messages"][1]["tool_calls"][0]["id"] == "too
 check("tool results become OpenAI tool messages", chat["messages"][2]["tool_call_id"] == "toolu_1")
 
 print()
+print("[1] Anthropic effort reaches the upstream-supported DeepSeek level")
+saved_reasoning_meta = P.model_reasoning_meta
+saved_fixed_effort = P.model_fixed_effort
+P.model_reasoning_meta = lambda _model: {
+    "supportedEfforts": ["low", "high", "max"],
+    "canDisableThinking": True,
+}
+P.model_fixed_effort = lambda _model: None
+try:
+    max_chat = P.messages_to_chat_feature({
+        "model": "deepseek-v4.1-flash",
+        "output_config": {"effort": "max"},
+        "messages": [],
+    })
+    max_upstream = P.build_upstream_body(max_chat)
+    check("output_config.effort=max becomes reasoning_effort=max",
+          max_upstream.get("reasoning_effort") == "max", max_upstream)
+    check("DeepSeek thinking is enabled with explicit effort",
+          max_upstream.get("thinking") == {"type": "enabled"}, max_upstream)
+    medium_chat = P.messages_to_chat_feature({
+        "model": "deepseek-v4.1-flash",
+        "output_config": {"effort": "medium"},
+        "messages": [],
+    })
+    check("medium maps through the catalog to supported high",
+          medium_chat.get("reasoning_effort") == "high", medium_chat)
+    disabled_chat = P.messages_to_chat_feature({
+        "model": "deepseek-v4.1-flash",
+        "thinking": {"type": "disabled"},
+        "messages": [],
+    })
+    disabled_upstream = P.build_upstream_body(disabled_chat)
+    check("disabled thinking uses DeepSeek's thinking toggle",
+          disabled_upstream.get("thinking") == {"type": "disabled"}
+          and "reasoning_effort" not in disabled_upstream, disabled_upstream)
+    main_chat = P.messages_to_chat({
+        "model": "deepseek-v4.1-flash",
+        "output_config": {"effort": "max"},
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    check("main and feature converters preserve explicit max",
+          main_chat.get("reasoning_effort") == "max", main_chat)
+finally:
+    P.model_reasoning_meta = saved_reasoning_meta
+    P.model_fixed_effort = saved_fixed_effort
+
+print()
 print("[1a] tool-result images stay structured instead of entering tool text as base64")
 image_data = "image-base64-sentinel"
 image_chat = P.messages_to_chat_feature({

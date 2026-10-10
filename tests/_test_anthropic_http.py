@@ -299,6 +299,7 @@ try:
     code, headers, body = request(
         "POST", "/v1/messages",
         {"model": "deepseek-v4.1-flash", "max_tokens": 64,
+         "output_config": {"effort": "max"},
          "system": [{"type": "text", "text": "be brief"}],
          "messages": [
              {"role": "user", "content": [{"type": "text", "text": "say hi"}]},
@@ -318,6 +319,9 @@ try:
           (msg.get("usage") or {}).get("input_tokens") == 11
           and (msg.get("usage") or {}).get("output_tokens") == 2, msg.get("usage"))
     sent = (MOCK["requests"][0].get("body") or {}) if MOCK["requests"] else {}
+    check("Claude output_config effort reaches DeepSeek as max",
+          sent.get("reasoning_effort") == "max"
+          and sent.get("thinking") == {"type": "enabled"}, sent)
     check("upstream saw the system prompt",
           any(m.get("role") == "system" and "be brief" in str(m.get("content"))
               for m in sent.get("messages") or []), sent.get("messages"))
@@ -327,6 +331,22 @@ try:
     check("feature adapter ignores mid-conversation system role",
           not any(m.get("role") == "system" and "hook ctx" in str(m.get("content"))
                   for m in sent.get("messages") or []), sent.get("messages"))
+
+    print()
+    print("[3a] each Claude Code effort reaches the request and usage row unchanged")
+    for requested in ("low", "high"):
+        MOCK["chunks"] = TEXT_CHUNKS
+        MOCK["requests"] = []
+        code, _headers, _body = request(
+            "POST", "/v1/messages",
+            {"model": "deepseek-v4.1-flash", "max_tokens": 64,
+             "output_config": {"effort": requested},
+             "messages": [{"role": "user", "content": "check effort"}]},
+            headers={"x-api-key": "TESTKEY"})
+        sent = (MOCK["requests"][0].get("body") or {}) if MOCK["requests"] else {}
+        check("%s reaches the upstream body" % requested,
+              code == 200 and sent.get("reasoning_effort") == requested,
+              (code, sent.get("reasoning_effort")))
 
     print()
     print("[4] streaming emits the native event sequence")
@@ -420,6 +440,9 @@ try:
     check("streamed messages record upstream timing",
           any(r.get("ttft_ms") is not None and r.get("gen_ms") is not None
               for r in stream_rows), stream_rows[-3:])
+    efforts = {r.get("reasoning_effort") for r in rows}
+    check("usage records low, high and max as requested",
+          {"low", "high", "max"}.issubset(efforts), efforts)
     check("streamed messages record cache hits",
           any((r.get("cached_tokens") or 0) == 3 for r in stream_rows), stream_rows[-3:])
 finally:
