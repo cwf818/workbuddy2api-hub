@@ -237,7 +237,10 @@ assert.ok(/--page-pad:clamp\(/.test(html), '缺少统一的页面左右留白变
 assert.ok(/header\{padding:16px var\(--page-pad\)/.test(html), 'header 应使用页面留白变量');
 assert.ok(/main\{padding:20px var\(--page-pad\)/.test(html), 'main 应使用页面留白变量');
 
-// 各页面区块数：导航就是照这些区块生成的，数量只增不减
+// 各页面区块数：导航就是照这些区块生成的，每个主页面都要有多个区块才有侧栏可跳。
+// 网关页现在只剩「最近请求」与「网关模型清单」两块：账号列表与「当前禁用」被
+// issue #176 拆到了「账号」页，成长任务与日常福利则被上游搬到了「任务与福利」页
+// （所以这里的下界从上游的 4 跟着落到 2——仍然是「够撑起侧栏」，不是「只增不减」）。
 const regions = {};
 const pageMarkers = [...html.matchAll(/<div id="page(\w+)" class="main-page">/g)];
 pageMarkers.forEach((m, i) => {
@@ -245,7 +248,8 @@ pageMarkers.forEach((m, i) => {
   const end = i + 1 < pageMarkers.length ? pageMarkers[i + 1].index : html.length;
   regions[m[1].toLowerCase()] = (html.slice(start, end).match(/<section/g) || []).length;
 });
-assert.ok(regions.gateway >= 4, 'gateway 应有多个区块，实际 ' + regions.gateway);
+assert.ok(regions.gateway >= 2, 'gateway 应有多个区块，实际 ' + regions.gateway);
+assert.ok(regions.accounts >= 3, 'accounts 应有多个区块，实际 ' + regions.accounts);
 assert.ok(regions.analytics >= 3, 'analytics 应有多个区块，实际 ' + regions.analytics);
 assert.ok(regions.settings >= 9, 'settings 应有多个区块，实际 ' + regions.settings);
 assert.strictEqual(regions.logs, 0, 'logs 目前是单一视图，没有 section');
@@ -312,6 +316,20 @@ assert.ok(navItems(gateway)[0].classList.contains('active'), '默认高亮第一
 const sidebarBefore = gateway.querySelector('.page-sidebar');
 api.initPageNav(gateway);
 assert.strictEqual(gateway.querySelector('.page-sidebar'), sidebarBefore, '清单没变时不应重建侧栏');
+
+/* 上面那条只钉住了**容器**：initPageNav 无论如何都复用同一个 .page-sidebar，
+   所以即使 nav 和每一项都被重新造过一遍，它也照样是绿的（本节末尾那条
+   「重建复用同一个侧栏容器」正是这个复用）。而真正会抖的是容器**里面**：
+   dashboard.html 的 signature 短路一旦失效，每次调用都会清空侧栏、新建 nav、
+   重建每个 .page-nav-item——悬停与键盘焦点丢失、点了没发出去的点击被丢掉。
+   所以这里再钉住子节点的身份：清单没变时，连 nav 和第一项都不许换。 */
+const navBefore = gateway.querySelector('.page-nav');
+const itemBefore = navItems(gateway)[0];
+api.initPageNav(gateway);
+assert.strictEqual(gateway.querySelector('.page-nav'), navBefore,
+  '清单没变时不应重建导航列表');
+assert.strictEqual(navItems(gateway)[0], itemBefore,
+  '清单没变时不应重建导航项');
 
 /* ---- 5. 区块清单变了就重建 ---- */
 secGrowth.style.display = 'block';                    // 成长任务显出来

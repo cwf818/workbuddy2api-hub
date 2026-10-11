@@ -270,13 +270,14 @@ class StreamTimeoutTests(unittest.TestCase):
 
             class Pool(object):
                 accounts = [account]
-                affinity = type("Affinity", (), {"unbind": lambda self, key: None})()
+                affinity = type("Affinity", (), {"unbind": lambda self, key: None,
+                                                 "demote": lambda self, key, uid=None: None})()
 
                 def count_ready(self, realm, model=None):
                     return 1
 
                 def pick_for_session(self, realm, session_key=None, exclude=(),
-                                     model=None):
+                                     model=None, page=None):
                     return account
 
                 def list_public(self):
@@ -290,6 +291,10 @@ class StreamTimeoutTests(unittest.TestCase):
 
                 def apply_model_daily_token_limit(self, *args, **kwargs):
                     return 0
+
+                def apply_remaining_weights(self, weights=None):
+                    # 优先调度的权重表也由请求路径推给池；桩只负责接住调用。
+                    return weights or {}
 
             old_pool, old_urlopen = wb_proxy.POOL, wb_accounts.urlopen
             wb_proxy.POOL = Pool()

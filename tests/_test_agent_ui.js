@@ -201,6 +201,12 @@ const check = (label, cond, extra) => {
   check('the key picker is populated',
         /key-1/.test(keySel.innerHTML || ''), String(keySel.innerHTML).slice(0, 160));
 
+  // 计数与卡片必须对得上（issue #250）：列表是全部支持的客户端，检测到的只是
+  // 其中一部分，所以标题要把两个数字都写出来，而不是只报「已检测到」的那个。
+  const detectState = element('agentDetectState');
+  check('检测计数同时给出卡片总数与本机检测数',
+        /1 \/ 共 2/.test(detectState.textContent || ''), detectState.textContent);
+
   // An unknown client must not throw before the request is even built.
   requests.length = 0;
   await api.applyAgent('no-such-client', null);

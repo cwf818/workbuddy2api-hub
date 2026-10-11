@@ -1,4 +1,4 @@
-"""Affinity length cap and pool-sized chat concurrency.
+"""Affinity length cap, pool pages, and pool-sized chat concurrency.
 
 Two independent limits that both used to be fixed constants:
 
@@ -8,6 +8,12 @@ Two independent limits that both used to be fixed constants:
   hundred messages the oversized request makes the upstream drop the
   connection. ``WB_AFFINITY_MAX_MSGS`` releases the pin once a conversation is
   that long, trading its prefix cache for not being retried.
+
+  What it is released *into* is ``WB_AFFINITY_PAGE_SIZE``: 0 sends the
+  conversation back to the whole pool (the 1.6.x behaviour), 1 keeps it pinned
+  (the cap switched off), and anything higher rotates it over one page of the
+  pool so every account of that page keeps a warm copy of the prefix. The page
+  tests below pin the boundary; the pool side is in ``_test_affinity_pages.py``.
 
 * ``MAX_CONCURRENT_CHAT`` was a fixed 32 regardless of pool size.
   ``WB_MAX_CONCURRENT_CHAT=auto`` sizes it from the ready-account count.
@@ -43,9 +49,13 @@ class AffinityLengthCapTests(unittest.TestCase):
 
     def setUp(self):
         self._saved = wb_proxy.AFFINITY_MAX_MSGS
+        self._saved_page = wb_proxy.AFFINITY_PAGE_SIZE
+        # The 1.6.x behaviour the release tests pin: no page, back to the pool.
+        wb_proxy.AFFINITY_PAGE_SIZE = 0
 
     def tearDown(self):
         wb_proxy.AFFINITY_MAX_MSGS = self._saved
+        wb_proxy.AFFINITY_PAGE_SIZE = self._saved_page
 
     def test_short_conversations_still_bind(self):
         wb_proxy.AFFINITY_MAX_MSGS = 400
@@ -54,7 +64,7 @@ class AffinityLengthCapTests(unittest.TestCase):
             self.assertTrue(key, "msgs=%d should keep its affinity key" % length)
             self.assertTrue(key.startswith("pfx-"))
 
-    def test_long_conversations_are_released(self):
+    def test_long_conversations_are_released_when_the_page_is_off(self):
         wb_proxy.AFFINITY_MAX_MSGS = 400
         for length in (401, 500, 1245):
             self.assertIsNone(
@@ -92,6 +102,85 @@ class AffinityLengthCapTests(unittest.TestCase):
         wb_proxy.AFFINITY_MAX_MSGS = 400
         self.assertIsNone(wb_proxy.derive_affinity_key(None))
         self.assertIsNone(wb_proxy.derive_affinity_key([]))
+
+
+class AffinityPageTests(unittest.TestCase):
+    """Past the cap a conversation rotates over one page, not the whole pool."""
+
+    def setUp(self):
+        self._saved_msgs = wb_proxy.AFFINITY_MAX_MSGS
+        self._saved_page = wb_proxy.AFFINITY_PAGE_SIZE
+        self._saved_prefix = wb_proxy.AFFINITY_BY_PREFIX
+        wb_proxy.AFFINITY_MAX_MSGS = 400
+
+    def tearDown(self):
+        wb_proxy.AFFINITY_MAX_MSGS = self._saved_msgs
+        wb_proxy.AFFINITY_PAGE_SIZE = self._saved_page
+        wb_proxy.AFFINITY_BY_PREFIX = self._saved_prefix
+
+    def test_a_long_conversation_gets_a_key_and_a_page(self):
+        wb_proxy.AFFINITY_PAGE_SIZE = 3
+        key, page = wb_proxy.affinity_route(conversation(500))
+        self.assertTrue(key and key.startswith("pfx-"))
+        self.assertIsNotNone(page, "500 msgs must rotate over a page")
+        index, size = page
+        self.assertEqual(size, 3)
+        self.assertTrue(0 <= index < size, "page index out of range: %r" % (page,))
+
+    def test_the_key_survives_crossing_the_cap(self):
+        """One conversation, one key: the binding carries over the boundary."""
+        wb_proxy.AFFINITY_PAGE_SIZE = 3
+        short = wb_proxy.derive_affinity_key(conversation(400))
+        long_key = wb_proxy.derive_affinity_key(conversation(500))
+        self.assertEqual(short, long_key)
+
+    def test_the_page_is_stable_across_turns(self):
+        wb_proxy.AFFINITY_PAGE_SIZE = 3
+        first = wb_proxy.affinity_route(conversation(401))[1]
+        later = wb_proxy.affinity_route(conversation(900))[1]
+        self.assertEqual(first, later)
+
+    def test_distinct_conversations_spread_over_pages(self):
+        wb_proxy.AFFINITY_PAGE_SIZE = 3
+        pages = set()
+        for index in range(60):
+            msgs = conversation(500)
+            msgs[1] = {"role": "user", "content": "conversation %d" % index}
+            pages.add(wb_proxy.affinity_route(msgs)[1][0])
+        self.assertGreater(len(pages), 1,
+                           "every conversation landing on one page would be a "
+                           "pin with extra steps")
+
+    def test_page_size_one_pins_instead(self):
+        wb_proxy.AFFINITY_PAGE_SIZE = 1
+        key, page = wb_proxy.affinity_route(conversation(500))
+        self.assertTrue(key, "1 means pinned, so the conversation keeps its key")
+        self.assertIsNone(page)
+
+    def test_page_size_zero_keeps_the_pool_rotation(self):
+        wb_proxy.AFFINITY_PAGE_SIZE = 0
+        key, page = wb_proxy.affinity_route(conversation(500))
+        self.assertIsNone(key)
+        self.assertIsNone(page)
+
+    def test_the_route_and_the_key_agree(self):
+        wb_proxy.AFFINITY_PAGE_SIZE = 3
+        for length in (10, 400, 500):
+            msgs = conversation(length)
+            self.assertEqual(wb_proxy.derive_affinity_key(msgs),
+                             wb_proxy.affinity_route(msgs)[0])
+
+    def test_switching_prefix_affinity_off_releases_everything(self):
+        wb_proxy.AFFINITY_PAGE_SIZE = 3
+        wb_proxy.AFFINITY_BY_PREFIX = False
+        for length in (10, 500):
+            self.assertEqual(wb_proxy.affinity_route(conversation(length)),
+                             (None, None))
+
+    def test_degenerate_inputs_are_safe(self):
+        wb_proxy.AFFINITY_PAGE_SIZE = 3
+        for msgs in (None, []):
+            self.assertEqual(wb_proxy.affinity_route(msgs), (None, None))
 
 
 class ChatSlotResizeTests(unittest.TestCase):

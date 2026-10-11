@@ -154,7 +154,8 @@ class DailyTokenLimitTests(unittest.TestCase):
             def count_ready(self, realm, model=None):
                 return sum(a.ready(model=model) for a in self.accounts)
 
-            def pick_for_session(self, realm, session_key=None, exclude=(), model=None):
+            def pick_for_session(self, realm, session_key=None, exclude=(), model=None,
+                                 page=None):
                 return next((a for a in self.accounts if a.uid not in exclude
                             and a.realm == realm
                             and a.ready(model=model)), None)
@@ -168,6 +169,10 @@ class DailyTokenLimitTests(unittest.TestCase):
 
             def apply_model_daily_token_limit(self, value=None, per_model=None):
                 return value or 0
+
+            def apply_remaining_weights(self, weights=None):
+                # 优先调度的权重表也由请求路径推给池；桩只负责接住调用。
+                return weights or {}
 
         old_pool = P.POOL
         P.POOL = Pool()

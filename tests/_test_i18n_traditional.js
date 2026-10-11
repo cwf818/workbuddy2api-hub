@@ -100,6 +100,8 @@ const terms = [
   ['软件', '軟體'],
   ['默认', '預設'],
   ['登录', '登入'],
+  // 签到用「簽」而不是「籤」：字表里 签 → 籤 是错的，签到、签名都该是簽。
+  ['签到与活跃记录', '簽到與活躍記錄'],
 ];
 for (const [src, want] of terms) {
   check(zh.win.WB_I18N.translateHant(src) === want,

@@ -31,7 +31,7 @@ const html = dashboardHtml();
 check('区块容器在页面里', html.includes('id="creditGrantsSection"'));
 check('表体在页面里', html.includes('id="creditGrantsTbody"'));
 check('整行表头与列序在页面里',
-      html.includes('<thead><tr><th>时间</th><th>账号</th><th>区域</th><th>名称</th><th>积分</th><th>剩余</th><th>到期</th><th>状态</th></tr></thead>'));
+      html.includes('<thead><tr><th>时间</th><th>账号</th><th>区域</th><th>名称</th><th>来源</th><th>积分</th><th>剩余</th><th>到期</th><th>状态</th></tr></thead>'));
 check('滚动容器的表头是 sticky（与扣减历史同款）', html.includes('#creditGrantsTable thead th'));
 check('说明写清了数据是快照', html.includes('数据是最近一次「刷新积分」的快照'));
 
@@ -72,6 +72,10 @@ api.renderCreditGrants({
   summary: {count: 4, size: 190, remain: 120.54, used: 69.46, accounts: 2},
   rows: [
     row({}),
+    row({uid: 'uid-5', nickname: 'hades', realm: 'cn', size: 100, remain: 100,
+         name: 'CodeBuddy个人版国内运营裂变包', status: 'available',
+         grant_reason: 'Buddy 加油站签到',
+         action: {task: 'checkin', ts: '2026-10-10T00:07:34+08:00', ok: true, delta_seconds: 1}}),
     row({uid: 'uid-2', nickname: 'hades', realm: 'cn', name: 'Free Plan Subscription',
          size: 100, remain: 100, used: 0, status: 'available', no_expiry: true,
          expire_iso: '2034-12-18 21:27:52', days_left: null}),
@@ -92,6 +96,13 @@ check('可用但未在扣减的包带「可用」徽章', out.includes('可用')
 check('用完的包带「已用完」徽章', out.includes('已用完'), out);
 check('过期的包带「已过期」徽章', out.includes('已过期'), out);
 check('不过期的包显示「不过期」', out.includes('不过期'), out);
+check('上游给了发放原因就原样显示在来源列', out.includes('Buddy 加油站签到'), out);
+check('本机动作关联进来源列的悬停提示',
+      out.includes('本机动作：每日签到 10-10 00:07 成功'), out);
+check('上游发放原因也在悬停提示里', out.includes('上游发放原因：Buddy 加油站签到'), out);
+check('国际版 Bonus Pack 30 按规则推断为每日活跃奖励',
+      out.includes('每日活跃奖励') && out.includes('按包名与面额推断'), out);
+check('既没有原因也推断不出时来源显示 —', /<td[^>]*>—<\/td>/.test(out), out);
 check('区域列按中英文界面词画出', out.includes('国内版') && out.includes('国际版'), out);
 check('摘要给出笔数、合计、剩余与快照时刻',
       summaryEl.textContent.includes('共 4 笔') && summaryEl.textContent.includes('合计 190')

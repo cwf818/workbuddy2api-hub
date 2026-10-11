@@ -127,7 +127,7 @@ class ModelCooldownTests(unittest.TestCase):
         self.assertEqual(failures, [])
 
     def drive_one_429(self, account, detail="usage exceeds frequency limit",
-                      stub_parser=True):
+                      stub_parser=True, model="glm-5.3", target_realm="cn"):
         """Drive open_upstream into an upstream 429 with a stubbed urlopen.
 
         Returns the reset instant the stubbed parser reported, so callers can
@@ -140,12 +140,14 @@ class ModelCooldownTests(unittest.TestCase):
 
         class Pool(object):
             accounts = [account]
-            affinity = types.SimpleNamespace(unbind=lambda _key: None)
+            affinity = types.SimpleNamespace(unbind=lambda _key: None,
+                                             demote=lambda _key, _uid=None: None)
 
             def count_ready(self, realm, model=None):
                 return sum(a.ready(model=model) for a in self.accounts)
 
-            def pick_for_session(self, realm, session_key=None, exclude=(), model=None):
+            def pick_for_session(self, realm, session_key=None, exclude=(), model=None,
+                                 page=None):
                 return next((a for a in self.accounts if a.uid not in exclude
                              and a.realm == realm and a.ready(model=model)), None)
 
@@ -164,6 +166,11 @@ class ModelCooldownTests(unittest.TestCase):
             def apply_model_daily_token_limit(self, value=None, per_model=None):
                 return value or 0
 
+            def apply_remaining_weights(self, weights=None):
+                # 剩余用量优先调度的权重表也由请求路径推给池；桩只负责接住
+                # 调用（开关默认关，推来的就是 None）。
+                return weights or {}
+
         old_pool, old_urlopen = proxy.POOL, accounts.urlopen
         old_parser = proxy.parse_rate_limit_reset
         proxy.POOL = Pool()
@@ -174,17 +181,52 @@ class ModelCooldownTests(unittest.TestCase):
             proxy.parse_rate_limit_reset = lambda _detail: reset
         try:
             with self.assertRaises(proxy.RateLimited):
-                proxy.open_upstream({"model": "glm-5.3", "messages": [
-                    {"role": "user", "content": "hello"}]}, target_realm="cn")
+                proxy.open_upstream({"model": model, "messages": [
+                    {"role": "user", "content": "hello"}]}, target_realm=target_realm)
         finally:
             proxy.POOL, accounts.urlopen = old_pool, old_urlopen
             proxy.parse_rate_limit_reset = old_parser
             error.close()
         return reset
 
+    def cap_body(self, reset_wall, code=6004):
+        """A 429 body whose reset clock resolves back to `reset_wall`.
+
+        The stamp is the instant's UTC+8 wall clock (gmtime), so the shipped
+        parser resolves it to the same instant on any host timezone - the same
+        recipe the remaining-usage suite uses (cap_detail). In a DST zone the
+        parser converts with the standard offset while mktime uses the summer
+        one, so the stamp is corrected against the shipped parser before
+        returning (the mapping is piecewise linear; one correction hits).
+        """
+        reset = int(reset_wall)
+        offset = reset + 8 * 3600
+        detail = ""
+        for _ in range(3):
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(offset))
+            detail = ('{"code":%d,"msg":"usage exceeds frequency limit, but don\'t '
+                      'worry, your usage will reset at %s UTC+8, alternatively, you '
+                      'can switch to the other models to continue using it."}'
+                      % (code, stamp))
+            parsed = proxy.parse_rate_limit_reset(detail)
+            if parsed == reset:
+                break
+            offset += reset - parsed
+        return detail
+
     def test_upstream_429_reaches_accounts_payload(self):
         account = self.account()
-        reset = self.drive_one_429(account)
+        # 429 会把撞线时刻持久化进凭证档（_save_account_caps），而这条用例的
+        # 合成账号没有自己的文件——不隔离账号目录，它会往 checkout 的 accounts/
+        # 落一份 synthetic-cn.json，并污染并行跑的 checkpoint 套件（那些套件的
+        # 子进程按硬编码路径读到它，realm 指纹就和父进程对不上了）。
+        directory = tempfile.mkdtemp(prefix="cap-save-")
+        old_dir = proxy.ACCOUNTS_DIR
+        proxy.ACCOUNTS_DIR = directory
+        try:
+            reset = self.drive_one_429(account)
+        finally:
+            proxy.ACCOUNTS_DIR = old_dir
         row = account.public()
         self.assertFalse(row["inCooldown"])
         self.assertEqual(row["modelCooldowns"][0]["model"], "glm-5.3")
@@ -370,6 +412,250 @@ class ModelCooldownTests(unittest.TestCase):
             proxy.ACCOUNTS_DIR = old_dir
             proxy.MAX_PRODUCT_SWITCHES = old_budget
             proxy._SWITCH_LOG.clear()
+
+    def test_a_6004_keeps_the_disable_across_an_identity_switch(self):
+        """端到端：auto-switch 开着时，撞线后账号仍然处于禁用。
+
+        429 分支的顺序是「记 cap（挂模型冷却 + 写凭证档）→ 换身分」，换身分
+        会走 set_product/clear_error 的清理路径；这里钉住整条链结束时 cap 与
+        冷却都还在（真机 2026-10-10 的四个撞线账号在切换后都被清成了可用）。
+        """
+        directory = tempfile.mkdtemp(prefix="cap-switch-")
+        settings.set_auto_switch_product(directory, True)
+        old_dir = proxy.ACCOUNTS_DIR
+        old_budget = proxy.MAX_PRODUCT_SWITCHES
+        proxy.ACCOUNTS_DIR = directory
+        proxy.MAX_PRODUCT_SWITCHES = 1
+        proxy._SWITCH_LOG.clear()
+        try:
+            account = self.account()
+            reset = time.time() + 600
+            self.drive_one_429(account, detail=self.cap_body(reset),
+                               model="hy4-preview-f", target_realm="cn")
+            # 身分换了（auto-switch 生效）……
+            self.assertEqual(account.product, "vscode")
+            self.assertTrue(proxy._SWITCH_LOG)
+            # ……但禁用必须留下：cap 记录与模型冷却都还在。
+            self.assertIn("hy4-preview-f", account.model_caps)
+            self.assertFalse(account.ready(model="hy4-preview-f"))
+            self.assertEqual([c["model"] for c in account.public()["modelCooldowns"]],
+                             ["hy4-preview-f"])
+        finally:
+            proxy.ACCOUNTS_DIR = old_dir
+            proxy.MAX_PRODUCT_SWITCHES = old_budget
+            proxy._SWITCH_LOG.clear()
+
+    def test_switching_the_identity_keeps_a_cap_backed_disable(self):
+        """set_product 的清理不能把 6004 的禁用一起清掉。
+
+        这是真机 bug 的直接钉法：换身分（无论谁调）只清限流窗口，恢复期内
+        的 cap 禁用跨身分成立。
+        """
+        account = self.account()
+        account.note_model_cap("hy4-preview-f", time.time() + 600)
+        account.note_error("429", model="glm-5.3", until=time.time() + 60)
+        self.assertTrue(account.set_product("vscode"))
+        self.assertFalse(account.ready(model="hy4-preview-f"),
+                         "换身分不能解除上游额度用满的禁用")
+        self.assertTrue(account.ready(model="glm-5.3"),
+                        "普通限流窗口照清")
+
+    def test_clear_error_keep_caps_spares_only_cap_backed_cooldowns(self):
+        account = self.account()
+        now = time.time()
+        account.note_model_cap("hy4-preview-f", now + 600)
+        account.note_error("429", model="glm-5.3", until=now + 60)
+        account.clear_error(keep_caps=True)
+        self.assertFalse(account.ready(model="hy4-preview-f"),
+                         "上游额度用满的禁用要留下")
+        self.assertTrue(account.ready(model="glm-5.3"),
+                        "普通限流窗口照清")
+        account.clear_error()
+        self.assertTrue(account.ready(model="hy4-preview-f"),
+                        "不带 keep_caps 时仍然整片清掉")
+
+    def test_a_repeated_6004_rearms_a_cleared_cooldown(self):
+        account = self.account()
+        reset = time.time() + 600
+        self.assertTrue(account.note_model_cap("hy4-preview-f", reset))
+        account.clear_error()
+        self.assertTrue(account.ready(model="hy4-preview-f"))
+        # 同一个窗口的第二次 6004：不用重写凭证档（返回 False），但冷却要挂
+        # 回来——否则这个窗口就一直不会被禁用。
+        self.assertFalse(account.note_model_cap("hy4-preview-f", reset))
+        self.assertFalse(account.ready(model="hy4-preview-f"))
+
+    # ------------------------------------------------------------------
+    # 限额联动：6004 → 记录（撞线/恢复时刻）→ 跨重启禁用，仅限免费模型
+    # ------------------------------------------------------------------
+
+    def test_the_free_cap_scope_is_the_confirmed_model_lists(self):
+        """范围是用户确认过的口径：intl 三个免费模型，cn 两个（deepseek 收费）。"""
+        self.assertEqual(sorted(accounts.FREE_CAP_MODELS["intl"]),
+                         ["deepseek-v4.1-flash", "hy3", "hy4-preview-f"])
+        self.assertEqual(sorted(accounts.FREE_CAP_MODELS["cn"]), ["hy3", "hy4-preview-f"])
+        self.assertTrue(accounts.is_free_cap_model("intl", "deepseek-v4.1-flash"))
+        self.assertTrue(accounts.is_free_cap_model("cn", "hy4-preview-f"))
+        self.assertFalse(accounts.is_free_cap_model("cn", "deepseek-v4.1-flash"),
+                         "国内版的 deepseek-v4.1-flash 是收费模型（x0.11）")
+        self.assertFalse(accounts.is_free_cap_model("intl", "hy4-preview"),
+                         "hy4-preview 是付费变体（x0.29）")
+        self.assertFalse(accounts.is_free_cap_model("intl", "glm-5.3"))
+        self.assertFalse(accounts.is_free_cap_model("", "hy3"), "未知区域失败关闭")
+        self.assertFalse(accounts.is_free_cap_model("intl", ""))
+
+    def test_note_model_cap_only_records_models_in_the_free_scope(self):
+        cn = self.account()
+        intl = accounts.Account({"uid": "synthetic-intl", "realm": "intl",
+                                 "accessToken": "token"})
+        now = time.time()
+        # 范围外：付费模型、以及国内版不算免费的 deepseek
+        self.assertFalse(cn.note_model_cap("glm-5.3", now + 600))
+        self.assertFalse(cn.note_model_cap("deepseek-v4.1-flash", now + 600))
+        self.assertEqual(cn.model_caps, {})
+        # 范围内：两区都免费的两个 + intl 的 deepseek
+        self.assertTrue(cn.note_model_cap("hy3", now + 600))
+        self.assertTrue(intl.note_model_cap("deepseek-v4.1-flash", now + 600))
+        # 同一个窗口重复撞线不算新记录（避免每次都重写凭证档）
+        self.assertFalse(cn.note_model_cap("hy3", now + 600))
+        # 没有恢复时刻可记的 6004 也不写
+        self.assertFalse(cn.note_model_cap("hy4-preview-f", 0))
+        self.assertNotIn("hy4-preview-f", cn.model_caps)
+
+    def test_a_stored_out_of_scope_cap_is_dropped_and_not_restored(self):
+        """旧版本存下的范围外 cap 在加载时丢弃，也不会被 restore 重新挂上。"""
+        now = time.time()
+        account = accounts.Account({
+            "uid": "synthetic-cn", "realm": "cn", "accessToken": "token",
+            "modelCaps": {
+                "glm-5.3": {"at": now, "reset": now + 600},
+                "hy3": {"at": now, "reset": now + 600},
+            },
+        })
+        self.assertEqual(list(account.model_caps), ["hy3"])
+        self.assertEqual(account.restore_model_caps(), ["hy3"])
+        self.assertIn("hy3", account.model_cooldowns)
+        self.assertNotIn("glm-5.3", account.model_cooldowns)
+        self.assertFalse(account.ready(model="hy3"))
+        self.assertTrue(account.ready(model="glm-5.3"))
+        with mock.patch.object(accounts.time, "time", return_value=now + 601):
+            self.assertTrue(account.ready(model="hy3"), "恢复时间过后自动解除")
+
+    def test_a_6004_on_a_free_model_survives_a_restart_and_then_expires(self):
+        """整条链：6004 → cap 写盘 → 重启（新建池 + load）仍在禁用 → 到点解除。"""
+        directory = tempfile.mkdtemp(prefix="cap-restart-")
+        old_dir = proxy.ACCOUNTS_DIR
+        proxy.ACCOUNTS_DIR = directory
+        try:
+            detail = self.cap_body(time.time() + 3600)
+            reset = proxy.parse_rate_limit_reset(detail)
+            self.assertIsNotNone(reset, "夹具的 6004 必须带可解析的重置时刻")
+            account = accounts.Account({"uid": "synthetic-intl", "realm": "intl",
+                                        "accessToken": "token"})
+            started = time.time()
+            self.drive_one_429(account, detail=detail, stub_parser=False,
+                               model="deepseek-v4.1-flash", target_realm="intl")
+
+            cap = account.model_caps["deepseek-v4.1-flash"]
+            self.assertLessEqual(abs(cap["reset"] - reset), 2)
+            self.assertGreaterEqual(cap["at"], started - 1)
+            self.assertLessEqual(cap["at"], time.time())
+            # 面板显示的数据源：冷却条目带 cappedAt（撞线时刻）
+            entry = next(item for item in account.public()["modelCooldowns"]
+                         if item["model"] == "deepseek-v4.1-flash")
+            self.assertLessEqual(abs(entry["cappedAt"] - cap["at"]), 2)
+
+            # 持久化：凭证档里带着 modelCaps（RUNTIME_ONLY_FIELDS 不带它）
+            saved_path = os.path.join(directory, "synthetic-intl.json")
+            self.assertTrue(os.path.exists(saved_path))
+            with open(saved_path, encoding="utf-8") as fh:
+                saved = json.load(fh)
+            self.assertIn("deepseek-v4.1-flash", saved.get("modelCaps") or {})
+
+            # 重启 = 新建池 + load()：恢复时间内仍在禁用，选择逻辑跳过该模型
+            pool = accounts.AccountPool(directory)
+            loaded = pool.load()
+            self.assertEqual(len(loaded), 1)
+            revived = loaded[0]
+            self.assertGreaterEqual(revived.model_cooldowns.get("deepseek-v4.1-flash", 0.0),
+                                    reset - 2)
+            self.assertFalse(revived.ready(model="deepseek-v4.1-flash"))
+            self.assertTrue(revived.ready(model="glm-5.3"), "同账号其他模型不受影响")
+            self.assertIsNone(pool.pick(realm="intl", model="deepseek-v4.1-flash"),
+                              "重启后选择逻辑仍跳过被禁用的模型")
+            self.assertEqual(pool.pick(realm="intl", model="glm-5.3").uid, "synthetic-intl")
+            revived_row = next(item for item in revived.public()["modelCooldowns"]
+                               if item["model"] == "deepseek-v4.1-flash")
+            self.assertIn("cappedAt", revived_row, "重启加载后面板仍能显示撞线时间")
+
+            # 恢复时间过了以后自动解除
+            with mock.patch.object(accounts.time, "time", return_value=reset + 1):
+                self.assertTrue(revived.ready(model="deepseek-v4.1-flash"))
+                self.assertEqual(pool.pick(realm="intl", model="deepseek-v4.1-flash").uid,
+                                 "synthetic-intl")
+        finally:
+            proxy.ACCOUNTS_DIR = old_dir
+
+    def test_a_6004_outside_the_scope_is_never_recorded(self):
+        """范围外的模型（付费、或另一区域的免费模型）收到 6004 也不记 cap。
+
+        既有的运行时冷却不受影响：429 带时钟时仍停到时钟（这条语义有测试钉住，
+        不随限额联动改变）。
+        """
+        for realm, model in (("cn", "glm-5.3"), ("cn", "deepseek-v4.1-flash"),
+                             ("intl", "glm-5.3")):
+            directory = tempfile.mkdtemp(prefix="cap-scope-%s-" % realm)
+            old_dir = proxy.ACCOUNTS_DIR
+            proxy.ACCOUNTS_DIR = directory
+            try:
+                detail = self.cap_body(time.time() + 3600)
+                reset = proxy.parse_rate_limit_reset(detail)
+                account = accounts.Account({"uid": "synthetic-%s" % realm,
+                                            "realm": realm, "accessToken": "token"})
+                self.drive_one_429(account, detail=detail, stub_parser=False,
+                                   model=model, target_realm=realm)
+                self.assertEqual(account.model_caps, {},
+                                 "%s/%s 不在限额联动范围内" % (realm, model))
+                row = account.public()["modelCooldowns"][0]
+                self.assertEqual(row["model"], model)
+                self.assertNotIn("cappedAt", row)
+                self.assertLessEqual(abs(row["expiresAt"] - reset), 2,
+                                     "运行时仍按上游时钟停到点")
+                self.assertFalse(os.path.exists(os.path.join(
+                    directory, "synthetic-%s.json" % realm)),
+                    "不写盘：重启后自动放开")
+            finally:
+                proxy.ACCOUNTS_DIR = old_dir
+
+    def test_only_code_6004_counts_as_a_cap(self):
+        """「达到限额」的唯一标志是 6004：带时钟的 14003 也不是额度判定。"""
+        self.assertTrue(proxy.rate_limit_is_cap(S3_INTL_6004))
+        self.assertTrue(proxy.rate_limit_is_cap('{"code":"6004","msg":"x"}'),
+                        "字符串形式的 code 不能把真 cap 漏掉")
+        self.assertFalse(proxy.rate_limit_is_cap(S1_BARE))
+        self.assertFalse(proxy.rate_limit_is_cap(S2_INTL_14003))
+        self.assertFalse(proxy.rate_limit_is_cap(""))
+        self.assertFalse(proxy.rate_limit_is_cap('{"code":null}'))
+
+        directory = tempfile.mkdtemp(prefix="cap-code-")
+        old_dir = proxy.ACCOUNTS_DIR
+        proxy.ACCOUNTS_DIR = directory
+        try:
+            detail = self.cap_body(time.time() + 3600, code=14003)
+            reset = proxy.parse_rate_limit_reset(detail)
+            self.assertIsNotNone(reset, "夹具必须带可解析的重置时刻")
+            account = accounts.Account({"uid": "synthetic-cn", "realm": "cn",
+                                        "accessToken": "token"})
+            # hy3 在范围内——挡住这条记录的是 code 判据本身，不是范围。
+            self.drive_one_429(account, detail=detail, stub_parser=False, model="hy3")
+            self.assertEqual(account.model_caps, {}, "非 6004 不记 cap")
+            row = account.public()["modelCooldowns"][0]
+            self.assertEqual(row["model"], "hy3")
+            self.assertNotIn("cappedAt", row)
+            self.assertLessEqual(abs(row["expiresAt"] - reset), 2)
+            self.assertFalse(os.path.exists(os.path.join(directory, "synthetic-cn.json")))
+        finally:
+            proxy.ACCOUNTS_DIR = old_dir
 
 
 if __name__ == "__main__":

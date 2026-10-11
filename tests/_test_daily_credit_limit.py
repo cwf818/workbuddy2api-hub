@@ -230,7 +230,7 @@ class CreditGuardPoolTests(unittest.TestCase):
                 return sum(a.ready(model=model) for a in accounts)
 
             def pick_for_session(self, realm, session_key=None, exclude=(),
-                                 model=None):
+                                 model=None, page=None):
                 return next((a for a in accounts if a.uid not in exclude
                              and a.realm == realm and a.ready(model=model)), None)
 
@@ -243,6 +243,10 @@ class CreditGuardPoolTests(unittest.TestCase):
 
             def apply_model_daily_token_limit(self, value=None, per_model=None):
                 return value or 0
+
+            def apply_remaining_weights(self, weights=None):
+                # 优先调度的权重表也由请求路径推给池；桩只负责接住调用。
+                return weights or {}
         return Pool()
 
     def test_pool_wide_credit_cap_answers_429_with_its_own_message(self):

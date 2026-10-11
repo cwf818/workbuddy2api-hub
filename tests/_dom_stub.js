@@ -141,6 +141,9 @@ function makeElement(tag, options) {
     // 面板用 firstElementChild 在日志终端里从头部裁行（跳过文本节点），
     // 真 DOM 的成员，这里也照真 DOM 建模：第一个元素子节点，没有就是 null。
     get firstElementChild() { return children.find(c => c && c.nodeType === 1) || null; },
+    // 同一个理由的另一头：设置页的页签清单读文本节点上的 i18n 原稿（__wbSrc），
+    // 用的是 firstChild 而不是 firstElementChild，因为原文就在文本节点上。
+    get firstChild() { return children[0] || null; },
     parentNode: null,
     parentElement: null,
     offsetWidth: 0,
@@ -177,15 +180,32 @@ function makeElement(tag, options) {
   // 节点不是同一个对象，按元素做的缓存（WeakMap 键）会整条链失效——真 DOM 里
   // documentElement === document.documentElement.parentNode 恒成立，桩要一致。
   let self = el;
-  el.appendChild = (child) => { children.push(child); if (child) child.parentNode = self; return child; };
+  // 真 DOM 里 appendChild / insertBefore 是**移动**：先把节点从原来的父节点摘下来
+  // 再挂过去。桩少了这一步的话，被搬走的节点会同时留在两个父节点的 children 里，
+  // 「把区块从这一页搬到那一页」这类操作写没写对就完全看不出来了。
+  const detach = (child) => {
+    const parent = child && child.parentNode;
+    if (parent && parent !== self && typeof parent.removeChild === 'function') {
+      parent.removeChild(child);
+    }
+  };
+  el.appendChild = (child) => {
+    detach(child);
+    children.push(child);
+    if (child) child.parentNode = self;
+    return child;
+  };
   el.removeChild = (child) => {
     const i = children.indexOf(child);
     if (i >= 0) children.splice(i, 1);
+    if (child) child.parentNode = null;
     return child;
   };
   el.insertBefore = (child, before) => {
+    detach(child);
     const i = children.indexOf(before);
     children.splice(i < 0 ? children.length : i, 0, child);
+    if (child) child.parentNode = self;
     return child;
   };
   el.append = (...nodes) => nodes.forEach(n => el.appendChild(n));

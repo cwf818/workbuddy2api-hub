@@ -201,5 +201,70 @@ check("载荷带 ok / rows / summary / 快照时刻",
       and body.get("fetched_iso"), body)
 
 print()
+print("[6] 发放记录 ↔ 本机签到 / 每日活跃的关联")
+
+import json as _json  # noqa: E402
+import datetime as _dt  # noqa: E402
+import wb_activity as A  # noqa: E402
+
+index = {"uid-alpha": [
+    {"at": 1000.0, "ts": "2026-10-10T00:00:00+08:00", "task": "checkin", "ok": True},
+    {"at": 5000.0, "ts": "2026-10-10T01:06:40+08:00", "task": "daily_chat", "ok": False},
+]}
+check("发放前 1 秒的动作算关联",
+      P._grant_action(index, "uid-alpha", 1001.0)["task"] == "checkin")
+check("关联结果带 delta_seconds 与 ok",
+      P._grant_action(index, "uid-alpha", 1001.0)["delta_seconds"] == 1
+      and P._grant_action(index, "uid-alpha", 1001.0)["ok"] is True)
+far = {"uid-far": [{"at": 1000.0, "ts": "2026-10-10T00:16:40+08:00",
+                   "task": "checkin", "ok": True}]}
+check("发放前 2 小时内仍算关联",
+      P._grant_action(far, "uid-far", 1000.0 + 7199)["task"] == "checkin")
+check("超出 2 小时窗口就不关联",
+      P._grant_action(far, "uid-far", 1000.0 + 7201) is None)
+check("发放时间比动作记录早几秒也认（上游时间戳抖动）",
+      P._grant_action(index, "uid-alpha", 940.0)["task"] == "checkin")
+check("取最近的一次动作，不是最早那次",
+      P._grant_action(index, "uid-alpha", 5001.0)["task"] == "daily_chat")
+check("没有动作记录的账号返回 None",
+      P._grant_action(index, "uid-other", 1000.0) is None)
+check("发放时间认不出来时返回 None",
+      P._grant_action(index, "uid-alpha", None) is None)
+
+# 磁盘那一侧：写一条带多余键的历史行，确认投影之后才用
+history = A.history_path()
+os.makedirs(os.path.dirname(history), exist_ok=True)
+created = P._parse_stamp_epoch("2026-10-10 00:42:45")
+with open(history, "a", encoding="utf-8") as fh:
+    fh.write(_json.dumps({
+        # 时间戳必须按机器自己的时区写：CI 上是 UTC，写死 +08:00 会让这条
+        # 记录被解析到 8 小时之外，关联窗口直接对不上。
+        "ts": _dt.datetime.fromtimestamp(created - 60).astimezone()
+                 .isoformat(timespec="seconds"),
+        "uid": "uid-alpha", "nickname": "meyadi", "realm": "intl",
+        "task": "daily_chat", "trigger": "scheduler", "ok": True,
+        "message": "ok", "accessToken": "SECRET"}) + "\n")
+
+actions = P._grant_actions()
+check("读历史文件并按 uid 建索引", "uid-alpha" in actions, list(actions))
+check("历史行里多出来的键不会跟着走（只留 at/ts/task/ok）",
+      all(set(item) == {"at", "ts", "task", "ok"}
+          for items in actions.values() for item in items), actions)
+check("索引里的时间是 epoch",
+      abs(actions["uid-alpha"][0]["at"] - (created - 60)) < 1, actions["uid-alpha"])
+
+try:
+    P.POOL = FakePool([FakeAccount("uid-alpha", "meyadi", "intl", [
+        pkg("Bonus Pack", 30, 30, "2026-10-10 00:42:45", "2026-11-10 00:42:44")])])
+    linked = P.credit_grants(now=NOW)
+finally:
+    P.POOL = _saved_pool
+check("发放行带上了关联到的那次本机动作",
+      linked["rows"][0]["action"]["task"] == "daily_chat"
+      and linked["rows"][0]["action"]["delta_seconds"] == 60,
+      linked["rows"][0].get("action"))
+
+print()
+print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
