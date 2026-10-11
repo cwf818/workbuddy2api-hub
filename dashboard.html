@@ -297,6 +297,17 @@ a:hover{text-decoration:underline}
 
 /* 顶部右侧区域与主题切换组件 (黑白单色、极简线条Outline、符合规范) */
 .header-right{display:flex;align-items:center;gap:10px}
+.branch-badge{
+  display:inline-flex;align-items:center;white-space:nowrap;
+  padding:4px 8px;border:1px solid rgba(234,88,12,.28);border-radius:999px;
+  background:rgba(249,115,22,.08);color:#c2410c;
+  font:600 11px/1.4 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+  letter-spacing:-.02em
+}
+.branch-badge[hidden]{display:none}
+[data-theme="dark"] .branch-badge{
+  border-color:rgba(251,146,60,.34);background:rgba(249,115,22,.14);color:#fdba74
+}
 .theme-dropdown-wrap{position:relative;display:inline-flex}
 .theme-btn{
   display:inline-flex;align-items:center;justify-content:center;
@@ -343,6 +354,7 @@ a:hover{text-decoration:underline}
   background:var(--panel2);box-shadow:var(--shadow-md);
 }
 @media (max-width: 640px){
+  .branch-badge{padding:4px 6px;font-size:10px}
   .lang-btn{min-width:36px;height:36px;padding:0 6px;font-size:12px}
 }
 
@@ -2628,6 +2640,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </a>
   </div>
   <div class="header-right">
+    <span class="branch-badge" data-no-i18n title="当前分支">⎇ feat/anthropic-messages-hybrid</span>
     <button type="button" class="lang-btn" id="langToggleBtn" onclick="toggleLang(event)" data-no-i18n title="切换语言 (简体中文 / 正體中文 / English)" aria-label="切换语言">
       <span id="langToggleLabel">EN</span>
     </button>
