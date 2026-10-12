@@ -17,6 +17,8 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _TMP = tempfile.mkdtemp(prefix="wb-pool-backoff-")
@@ -398,6 +400,98 @@ class PanelTestSuccessTests(unittest.TestCase):
         self.assertFalse(account.ready(model="glm-5.3"))
         self.assertIn("glm-5.3", [item["model"]
                                   for item in account.public()["modelCooldowns"]])
+
+
+class RetryRoundChargeTests(unittest.TestCase):
+    """One client request must not charge the same account twice (issue #271).
+
+    After a transient the retry loop clears `tried` so the whole pool is
+    re-scanned. With a single usable account that hands the same account back,
+    and before this guard it was charged again: two fails out of one request,
+    so two blips could trip the 3-failure breaker instead of three. The pool
+    being nearly empty is exactly when this bites, which is the incident
+    environment.
+    """
+
+    def _drive(self, account, urlopen):
+        class Pool(object):
+            accounts = [account]
+            affinity = type("Affinity", (), {
+                "unbind": lambda self, key: None,
+                "demote": lambda self, key, uid=None: None})()
+
+            def count_ready(self, realm, model=None):
+                return 1
+
+            def pick_for_session(self, realm, session_key=None, exclude=(),
+                                 model=None, page=None):
+                return None if account.uid in exclude else account
+
+            def list_public(self):
+                return []
+
+            def apply_daily_token_limit(self, *a, **k):
+                return 0
+
+            def apply_daily_credit_limit(self, *a, **k):
+                return 0
+
+            def apply_model_daily_token_limit(self, *a, **k):
+                return 0
+
+            def apply_remaining_weights(self, weights=None):
+                return weights or {}
+
+        old_pool, old_urlopen = wb_proxy.POOL, A.urlopen
+        wb_proxy.POOL = Pool()
+        A.urlopen = urlopen
+        try:
+            with mock.patch.object(wb_proxy, "ACCOUNTS_DIR",
+                                   os.path.join(_TMP, account.uid)):
+                try:
+                    wb_proxy.open_upstream(
+                        {"model": "deepseek-v4.1-flash",
+                         "messages": [{"role": "user", "content": "hi"}]},
+                        target_realm="intl")
+                except Exception:
+                    pass
+        finally:
+            wb_proxy.POOL, A.urlopen = old_pool, old_urlopen
+
+    def test_a_transport_blip_charges_the_account_once(self):
+        account = load_account("u-charge-transient")
+
+        def urlopen(req, timeout=30, proxy=""):
+            raise urllib.error.URLError("The handshake operation timed out")
+
+        with mock.patch.object(time, "sleep"):
+            self._drive(account, urlopen)
+        # The retry round re-picked the account; it must still be one charge.
+        self.assertEqual(account.fails, 1)
+        self.assertEqual(account.degrade_count, 1)
+
+    def test_a_gateway_5xx_charges_the_account_once(self):
+        account = load_account("u-charge-5xx")
+
+        def urlopen(req, timeout=30, proxy=""):
+            raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, None)
+
+        with mock.patch.object(time, "sleep"):
+            self._drive(account, urlopen)
+        self.assertEqual(account.fails, 1)
+
+    def test_the_guard_is_per_request_not_per_process(self):
+        # A second request is a second chance to be charged: the guard must not
+        # leak across requests (it would hide a genuinely failing account).
+        account = load_account("u-charge-two-requests")
+
+        def urlopen(req, timeout=30, proxy=""):
+            raise urllib.error.URLError("connection reset by peer")
+
+        with mock.patch.object(time, "sleep"):
+            self._drive(account, urlopen)
+            self._drive(account, urlopen)
+        self.assertEqual(account.fails, 2)
 
 
 if __name__ == "__main__":

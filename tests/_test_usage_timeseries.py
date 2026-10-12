@@ -89,6 +89,82 @@ class TimeseriesTests(unittest.TestCase):
                                                until=now)
         self.assertEqual(sum(b["total_tokens"] for b in all_realms["series"]), 300)
 
+    def credits_window(self, rows):
+        """写日志 + 清时间序列状态（切片/扫描两条路径都从零起）。"""
+        self.write(rows)
+        wb_proxy._series_cache.clear()
+        wb_proxy._series_state.clear()
+
+    def test_credits_top50_ties_keep_log_order(self):
+        # 70 条 at 完全相同的计费行跨第 50 名边界：选择必须是「at 倒序、
+        # 相同 at 保持日志顺序」——丢掉的只能是同 at 组里日志靠后的那些。
+        # 窗口从昨天本地午夜起：切片路径成立，行也全在过去。
+        midnight = wb_proxy._local_midnight(time.time() - 86400)
+        T = midnight + 3600.0
+        rows = [row(T, credit=100.0 + i) for i in range(70)]
+        rows += [row(T + 600, credit=200.0 + i) for i in range(5)]
+        rows += [row(T - 600, credit=1.0 + i) for i in range(20)]
+        self.credits_window(rows)
+        # 规范：Python 稳定排序（at 倒序 + 同 at 日志顺序）的前 50 条。
+        want = sorted([r for r in rows if r["credit"] > 0],
+                      key=lambda r: r["at"], reverse=True)[:50]
+        got = wb_proxy.usage_timeseries(realm="all", range="custom", since=midnight,
+                                        until=None, ttl=0)
+        self.assertEqual([(c["at"], c["credit"]) for c in got["credits"]],
+                         [(r["at"], r["credit"]) for r in want])
+        # 第 50 名落在同 at 组内部：留下的正是组里日志靠前的 45 条。
+        self.assertEqual(len(got["credits"]), 50)
+        self.assertEqual(got["credits"][5]["credit"], 100.0)
+        self.assertEqual(got["credits"][-1]["credit"], 144.0)
+        # 载荷的字段与键序是响应字节的一部分。
+        self.assertEqual(list(got["credits"][0].keys()),
+                         ["at", "iso", "model", "account", "credit", "total_tokens"])
+
+    def test_credits_scan_builds_only_the_top50_entries(self):
+        # 计数桩：整段扫描只为最终进前 50 的行建载荷。前 50 行就是窗口里
+        # 最新的 50 条，之后的 1950 行都进不了堆——旧实现会把 2000 条全部
+        # 建成字典再排序切片。
+        midnight = wb_proxy._local_midnight(time.time() - 86400)
+        T = midnight + 7200.0
+        rows = [row(T + 1000 - i, credit=500.0 + i) for i in range(50)]
+        rows += [row(T - i, credit=1.0 + i) for i in range(1950)]
+        self.credits_window(rows)
+        os.environ["WB_USAGE_DAY_BUCKETS"] = "0"  # 强制整段扫描路径
+        try:
+            with mock.patch.object(wb_proxy, "_series_credit_entry",
+                                   wraps=wb_proxy._series_credit_entry) as entry:
+                got = wb_proxy.usage_timeseries(realm="all", range="custom",
+                                                since=midnight, until=None, ttl=0)
+        finally:
+            os.environ.pop("WB_USAGE_DAY_BUCKETS", None)
+        self.assertEqual(entry.call_count, 50)
+        self.assertEqual([c["credit"] for c in got["credits"]],
+                         [500.0 + i for i in range(50)])
+
+    def test_credits_slice_and_scan_are_byte_identical(self):
+        # 同一份日志、同一个窗口：日桶切片与整段扫描（关掉日桶）逐字节一致。
+        midnight = wb_proxy._local_midnight(time.time() - 86400)
+        T = midnight + 3600.0
+        rows = [row(T + i * 3, credit=10.0 + i) for i in range(80)]
+        rows += [row(T + 100, credit=90.0) for _ in range(30)]  # 同 at 一组
+        self.credits_window(rows)
+        os.environ["WB_USAGE_DAY_BUCKETS"] = "0"
+        try:
+            wb_proxy._series_cache.clear()
+            wb_proxy._series_state.clear()
+            scan = wb_proxy.usage_timeseries(realm="all", range="custom",
+                                             since=midnight, until=None, ttl=0)
+        finally:
+            os.environ.pop("WB_USAGE_DAY_BUCKETS", None)
+        wb_proxy._series_cache.clear()
+        wb_proxy._series_state.clear()
+        sliced = wb_proxy.usage_timeseries(realm="all", range="custom",
+                                           since=midnight, until=None, ttl=0)
+        self.assertEqual(json.dumps(sliced["credits"], ensure_ascii=False),
+                         json.dumps(scan["credits"], ensure_ascii=False))
+        self.assertEqual(json.dumps(sliced["series"], ensure_ascii=False),
+                         json.dumps(scan["series"], ensure_ascii=False))
+
 
 class TimeseriesRouteTests(unittest.TestCase):
     def make_handler(self, authorized=True):

@@ -426,5 +426,259 @@ class AggregateMatchesPerRowCostingTests(AggregateHarness):
             self.assertEqual(bucket["all_time"][field], expected[field], field)
 
 
+class RowResultMemoTests(AggregateHarness):
+    """行级结果记忆：跨视图共享「这行折进哪天 / 这行值多少钱」。
+
+    钉四件事：
+      1. 开表与关表（两张表上限都置 0）跑同一份日志，三份载荷逐字节相同
+         （连键序都不许动）——记忆只该影响速度；
+      2. 三个视图扫同一份日志时，日键与算价只在第一遍真算（计数桩证明），
+         第二遍一行都不真算；
+      3. 表有界：满了以后只留最近的一批，旧行不进表，结果照旧正确；
+      4. 失效条件：价表被改写、进程时区被 tzset() 换过，旧条目都不许再命中
+         ——价表那条真改磁盘上的策略表来验，不看内部字段。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._caps = (P._ROW_MEMO_MAX, P._ROW_COST_MEMO_MAX)
+        P._row_day_memo.clear()
+        P._row_cost_memo.clear()
+
+    def tearDown(self):
+        P._ROW_MEMO_MAX, P._ROW_COST_MEMO_MAX = self._caps
+        P._row_day_memo.clear()
+        P._row_cost_memo.clear()
+        super().tearDown()
+
+    # ---- 工具 ----
+
+    def _cold_views(self):
+        """三份载荷各清一遍状态后冷扫；记忆表清不清由调用方决定。
+
+        另外各取一份 realm 过滤下的载荷：per-realm 状态是独立的，记忆表却是
+        跨 realm 共享的（日键与定价都与 realm 无关），两条都要对得上。
+        """
+        out = {}
+        for names, key, fn in (
+                (("_snap_cache", "_usage_snap_state"), "snapshot",
+                 lambda: P._usage_snapshot_uncached()),
+                (("_analytics_cache", "_analytics_state"), "analytics",
+                 lambda: P._compute_usage_analytics_uncached())):
+            for name in names:
+                getattr(P, name).clear()
+            out[key] = fn()
+        for name in ("_series_cache", "_series_state"):
+            getattr(P, name).clear()
+        out["series"] = P.usage_timeseries(
+            realm="all", range="custom", since=T0, until=T0 + 2 * 86400,
+            bucket_seconds=86400, ttl=0)
+        out["snap_intl"] = P._usage_snapshot_uncached(realm="intl")
+        out["snap_cn"] = P._usage_snapshot_uncached(realm="cn")
+        out["an_intl"] = P._compute_usage_analytics_uncached(realm="intl")
+        return out
+
+    def _payload(self):
+        return json.dumps(self._cold_views(), ensure_ascii=False)
+
+    def _memo_off(self):
+        P._ROW_MEMO_MAX = 0
+        P._ROW_COST_MEMO_MAX = 0
+        P._row_day_memo.clear()
+        P._row_cost_memo.clear()
+
+    def _memo_on(self):
+        P._ROW_MEMO_MAX, P._ROW_COST_MEMO_MAX = self._caps
+        P._row_day_memo.clear()
+        P._row_cost_memo.clear()
+
+    # ---- [1] 逐字节对拍 ----
+
+    def test_memo_off_and_on_produce_the_same_bytes(self):
+        self._memo_off()
+        want = self._payload()
+        self._memo_on()
+        got = self._payload()
+        if want != got:
+            for i in range(min(len(want), len(got))):
+                if want[i] != got[i]:
+                    self.fail("@%d: %r vs %r"
+                              % (i, want[i:i + 70], got[i:i + 70]))
+        # 第二次（表里已有条目）再跑一遍：命中路径同样逐字节相同。
+        self.assertEqual(want, self._payload())
+
+    # ---- [2] 计数桩：省下的工作真实存在 ----
+
+    def test_each_row_is_day_keyed_and_priced_once_per_scan_batch(self):
+        counts = {"strftime": 0, "cost": 0}
+        real_strftime = P.time.strftime
+        real_cost = wb_pricing.cost_for_row
+
+        def counted_strftime(fmt, *args, **kwargs):
+            if fmt == "%Y-%m-%d":        # _local_day_key 的格式
+                counts["strftime"] += 1
+            return real_strftime(fmt, *args, **kwargs)
+
+        def counted_cost(row, details=True, enabled=None):
+            counts["cost"] += 1
+            return real_cost(row, details=details, enabled=enabled)
+
+        P.time.strftime = counted_strftime
+        wb_pricing.cost_for_row = counted_cost
+        try:
+            self._memo_on()
+            self._cold_views()
+            first = dict(counts)
+            counts["strftime"] = counts["cost"] = 0
+            self._cold_views()
+            second = dict(counts)
+            self._memo_off()
+            counts["strftime"] = counts["cost"] = 0
+            self._cold_views()
+            plain = dict(counts)
+        finally:
+            P.time.strftime = real_strftime
+            wb_pricing.cost_for_row = real_cost
+
+        n = len(self.rows)
+        # 第一遍：日键每行一次（+ 剪枝线那几次），算价每行一次（analytics 对
+        # 中止行不算价，但那些行在快照里已经算过）。
+        self.assertGreaterEqual(first["strftime"], n)
+        self.assertLessEqual(first["strftime"], 2 * n)
+        self.assertGreaterEqual(first["cost"], n)
+        self.assertLessEqual(first["cost"], n + 2)
+        # 第二遍：日键与算价都在表里，一行都不真算。
+        self.assertEqual(second["strftime"], 0)
+        self.assertEqual(second["cost"], 0)
+        # 关表跑同一份日志：日键三遍全算、算价两个视图各算一遍——上面那两个
+        # 0 不是桩坏了，是记忆真的把工作省掉了。
+        self.assertGreaterEqual(plain["strftime"], 3 * n)
+        self.assertGreater(plain["cost"], first["cost"] + n - 2)
+
+    # ---- [3] 有界 ----
+
+    def test_the_day_table_keeps_the_newest_keys_only(self):
+        P._ROW_MEMO_MAX = 3
+        P._row_day_memo.clear()
+        for ts in (10, 20, 30, 40, 50):
+            P._local_day_key(ts)
+        self.assertEqual(sorted(P._row_day_memo), [30, 40, 50])
+        # 比表里最旧的还旧的 ts 不进表，但答案照旧真算、照旧正确。
+        self.assertEqual(P._local_day_key(5),
+                         time.strftime("%Y-%m-%d", time.localtime(5)))
+        self.assertEqual(sorted(P._row_day_memo), [30, 40, 50])
+
+    def test_the_cost_table_is_bounded_too(self):
+        P._ROW_COST_MEMO_MAX = 2
+        P._row_cost_memo.clear()
+        P._usage_snapshot_uncached()
+        self.assertLessEqual(len(P._row_cost_memo), 2)
+        kept = [key[2] for key in P._row_cost_memo]
+        self.assertIn(max(r["at"] for r in self.rows), kept)
+
+    # ---- [4] 失效条件 ----
+
+    def test_a_rewritten_price_table_is_never_served_from_the_table(self):
+        """策略表被改写：同一个策略 id 的费率翻倍，快照必须用新价。
+
+        改的是磁盘上的真文件（不是内部字段），所以这条同时钉住了「价表换代
+        → 记忆条目整体失效」与「状态指纹照样作废重折」两件事。
+        """
+        first = P._usage_snapshot_uncached()
+        self.assertGreater(first["cost_cny"], 0)
+        path = wb_pricing.policies_path()
+        lines = []
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                flat = row.get("flat") or {}
+                if flat.get("output"):
+                    flat["output"] = flat["output"] * 2
+                    row["flat"] = flat
+                lines.append(json.dumps(row, ensure_ascii=False))
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            for line in lines:
+                fh.write(line + "\n")
+        # 路径指纹有个 1 秒 TTL（本进程之外写下的变更最迟 1 秒内可见）：
+        # 测试不等这一秒，直接把它清掉，语义与「等过了 TTL」一致。
+        wb_pricing._file_key_cache.clear()
+        second = P._usage_snapshot_uncached()
+        self.assertGreater(second["cost_cny"], first["cost_cny"])
+        # 表里那条旧价必须已经作废：再折一遍仍是新价。
+        self.assertAlmostEqual(P._usage_snapshot_uncached()["cost_cny"],
+                               second["cost_cny"], places=9)
+
+    def test_a_timezone_change_drops_the_day_table(self):
+        """进程时区被 tzset() 换过：日键表整体作废（定价表不受影响）。
+
+        CPython 的 time.tzset() 每次都会重建 time.tzname 这个元组对象，所以
+        这里用一个 time 代理模拟：换掉 tzname 之前命中，换掉之后必须重算。
+        """
+
+        class _Clock(object):
+            def __init__(self, tz, key):
+                self.tzname = tz
+                self._key = key
+
+            def localtime(self, ts):
+                return ts
+
+            def strftime(self, fmt, ts):
+                return self._key
+
+        real_time = P.time
+        clock = _Clock(("A", "B"), "2001-01-01")
+        P.time = clock
+        try:
+            self.assertEqual(P._local_day_key(123), "2001-01-01")
+            self.assertEqual(P._local_day_key(456), "2001-01-01")
+            self.assertIn(456, P._row_day_memo)
+            clock._key = "2001-01-02"          # 时区没变：表照用
+            self.assertEqual(P._local_day_key(123), "2001-01-01")
+            clock.tzname = ("C", "D")          # tzset() 会重建这个元组
+            self.assertEqual(P._local_day_key(123), "2001-01-02")
+            self.assertNotIn(456, P._row_day_memo)
+        finally:
+            P.time = real_time
+
+    # ---- 形状与退化输入 ----
+
+    def test_the_table_returns_exactly_what_cost_for_row_returns(self):
+        """命中与未命中给出的 dict 与现算逐键同序、逐值相等。"""
+        pricing = P._pricing_inputs(True)
+        self.assertIsNotNone(pricing)
+        off_pricing = P._pricing_inputs(False)
+        for r in self.rows:
+            for enabled, inputs in ((True, pricing), (False, off_pricing)):
+                want = wb_pricing.cost_for_row(dict(r), details=False,
+                                               enabled=enabled)
+                miss = P._row_cost(dict(r), inputs, enabled)
+                hit = P._row_cost(dict(r), inputs, enabled)
+                self.assertEqual(list(miss.keys()), list(want.keys()))
+                self.assertEqual(list(hit.keys()), list(want.keys()))
+                self.assertEqual(miss, want)
+                self.assertEqual(hit, want)
+
+    def test_degenerate_rows_behave_exactly_as_before(self):
+        pricing = P._pricing_inputs(True)
+        for empty in (None, {}, []):
+            self.assertEqual(
+                P._row_cost(empty, pricing, True),
+                wb_pricing.cost_for_row(empty, details=False, enabled=True))
+        # 字段不可哈希（坏行）：两边都从同一处抛 TypeError，记忆不抢先。
+        bad = {"model": ["x"], "at": T0}
+        with self.assertRaises(TypeError):
+            P._row_cost(bad, pricing, True)
+        with self.assertRaises(TypeError):
+            wb_pricing.cost_for_row(bad, details=False, enabled=True)
+        # 价表读不出来（_pricing_inputs 返回 None）时不进表，照旧现算。
+        self.assertEqual(P._row_cost(dict(self.rows[0]), None, True),
+                         wb_pricing.cost_for_row(dict(self.rows[0]),
+                                                 details=False, enabled=True))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

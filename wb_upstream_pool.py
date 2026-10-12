@@ -563,6 +563,35 @@ def _read_error_body(resp):
         return b""
 
 
+def _fold_bypassed(host, proxy_raw):
+    """把「配了代理、但命中系统旁路清单」折叠成直连，返回 (proxy_info, proxy_raw)。
+
+    非 HTTP 代理（socks 等）抛 PoolBypass —— 那条路不走池，交回 urllib。
+    判定与 urllib ProxyHandler 完全一致（见 _proxy_bypassed）。
+    """
+    proxy_info = _split_proxy(proxy_raw)
+    if proxy_raw and proxy_info is None:
+        raise PoolBypass("proxy %r is not an http proxy" % (proxy_raw,))
+    if proxy_info and _proxy_bypassed(host):
+        return None, ""
+    return proxy_info, proxy_raw
+
+def egress_key(url, proxy=""):
+    """出站路径的稳定标识：同一物理出口的账号落在同一个键上。
+
+    与连接池键（见 urlopen）同一口径——(scheme, host, port, 代理串)，且把
+    「配了代理但命中系统旁路」折叠成直连。失败归账按这个键做，一组共享出口的
+    账号就自动共用一个计数器，而不是各自挨一次熔断（issue #271）。
+    非 HTTP 代理仍以原串入键：它虽然不走池，出口身份还是这个串。
+    """
+    scheme, host, port, _selector = _target_parts(url)
+    proxy_raw = str(proxy or "").strip()
+    try:
+        _proxy_info, proxy_raw = _fold_bypassed(host, proxy_raw)
+    except PoolBypass:
+        pass
+    return (scheme, host, port, proxy_raw)
+
 def urlopen(req, timeout=30, proxy=""):
     """连接池版 urlopen。签名与 wb_accounts.urlopen 一致。
 
@@ -578,12 +607,8 @@ def urlopen(req, timeout=30, proxy=""):
     """
     scheme, host, port, selector = _target_parts(req.full_url)
     proxy_raw = str(proxy or "").strip()
-    proxy_info = _split_proxy(proxy_raw)
-    if proxy_raw and proxy_info is None:
-        raise PoolBypass("proxy %r is not an http proxy" % (proxy_raw,))
-    if proxy_info and _proxy_bypassed(host):
-        # 系统旁路清单命中：与 urllib 一样直连（键也回到直连的池）
-        proxy_info, proxy_raw = None, ""
+    # 系统旁路清单命中时按直连处理（键也回到直连的池）——与 urllib 一致。
+    proxy_info, proxy_raw = _fold_bypassed(host, proxy_raw)
     if proxy_info and scheme == "http":
         # 经代理的 HTTP 请求：请求目标是绝对 URL（urllib set_proxy 同款）
         selector = req.full_url

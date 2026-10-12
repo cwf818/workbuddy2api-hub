@@ -156,12 +156,16 @@ result = P.chat_to_messages_feature({
         "content": "I will look it up.",
         "tool_calls": [{"id": "call_1", "function": {"name": "lookup", "arguments": '{"q":"x"}'}}],
     }}],
-    "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+    "usage": {"prompt_tokens": 8, "completion_tokens": 4,
+              "prompt_cache_hit_tokens": 3, "prompt_cache_write_tokens": 2},
 }, "m")
 check("tool calls use Anthropic stop reason", result["stop_reason"] == "tool_use")
 check("text content is returned", result["content"][0]["text"] == "I will look it up.")
 check("tool arguments are JSON objects", result["content"][1]["input"] == {"q": "x"})
-check("usage names match Anthropic", result["usage"] == {"input_tokens": 8, "output_tokens": 4})
+check("usage includes Anthropic cache token fields",
+      result["usage"] == {"input_tokens": 8, "output_tokens": 4,
+                          "cache_read_input_tokens": 3,
+                          "cache_creation_input_tokens": 2})
 
 print()
 print("[2] fragmented upstream tool arguments are preserved for Anthropic tools")
@@ -218,6 +222,9 @@ try:
                                "function": {"name": "Read",
                                             "arguments": '{"file_path":"C:/repo/a.py"}'}}]},
               "tool_calls"),
+        b'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3,'
+        b'"total_tokens":13,"prompt_cache_hit_tokens":6,'
+        b'"prompt_cache_write_tokens":1}}\n\n',
     ]), "m", None, SimpleNamespace(uid="test-account"), P.time.time() - 0.01)
 finally:
     P.record_usage = saved_record_usage
@@ -238,6 +245,11 @@ check("tool-use start event has an empty input object",
 check("tool-use JSON delta carries file_path",
       json.loads(tool_delta["delta"]["partial_json"]) == {"file_path": "C:/repo/a.py"},
       tool_delta)
+message_delta = next(frame for frame in frames if frame.get("type") == "message_delta")
+check("stream message_delta includes cache-read and cache-creation usage",
+      message_delta["usage"]["cache_read_input_tokens"] == 6
+      and message_delta["usage"]["cache_creation_input_tokens"] == 1,
+      message_delta)
 check("stream usage records time to first chunk and generation duration",
       bool(usage_records) and usage_records[0].get("ttft_ms") is not None
       and usage_records[0].get("gen_ms") is not None,

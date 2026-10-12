@@ -506,6 +506,18 @@ class Account(object):
         # Runtime-resolved value; recomputed by AccountPool.apply_proxy_slots().
         self.proxy = self.proxy_legacy
         self.enabled = data.get("enabled", True)
+        # 手动调度权重（面板按账号设置，1 = 不干预）。随凭证档持久化：这是
+        # 用户的明确分派意图，不该在重启后悄悄回到默认。非法值一律回落 1，
+        # 坏数据不至于让账号加载失败。
+        try:
+            self.weight = max(1, min(100, int(data.get("weight") or 1)))
+        except (TypeError, ValueError):
+            self.weight = 1
+        # 账号备注（面板自填，比如「批量」/「自用」）：随凭证档持久化，导出
+        # 与导入照常携带。只做展示，不参与任何调度判断；非字符串一律视为没
+        # 写过，超长截断，别让一条长备注把账号行撑爆。
+        raw_note = data.get("note")
+        self.note = (raw_note if isinstance(raw_note, str) else "").strip()[:200]
         # Live error state, never restored from the credential file: the label
         # describes the last upstream answer, not the credential. It used to be
         # persisted and read back, so a 429 that had long since recovered came
@@ -647,6 +659,8 @@ class Account(object):
             "proxySlot": self.proxy_slot,
             "proxy": self.proxy_legacy,
             "enabled": self.enabled,
+            "weight": self.weight,
+            "note": self.note,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
@@ -693,6 +707,8 @@ class Account(object):
             "product": self.product,
             "enterpriseId": self.enterprise_id,
             "enabled": bool(self.enabled),
+            "weight": int(self.weight),
+            "note": self.note,
             "source": self.source,
             "proxySlot": self.proxy_slot,
             "proxy": self.proxy,
@@ -1420,26 +1436,33 @@ class Account(object):
         try:
             with urlopen(req, timeout=20, proxy=self.proxy) as resp:
                 _ = resp.read()
-            self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
-            if self.path and os.path.exists(os.path.dirname(self.path)):
-                self.save(os.path.dirname(self.path))
             try:
                 self.fetch_credits()
             except Exception:
                 pass
             result = {"ok": True, "msg": "每日活跃对话成功完成"}
+            web_ok = True
             if web is None:
                 web = bool(self.path) and wb_settings.daily_chat_web(os.path.dirname(self.path))
             if web:
                 res = self.daily_chat_web(trigger=None)
                 result["web"] = res
-                if res.get("ok"):
+                web_ok = bool(res.get("ok"))
+                if web_ok:
                     result["msg"] = ("每日活跃对话成功完成（网页通道 %s：%d 段输出，%d ms）"
                                      % (res.get("status") or "completed",
                                         res.get("chunks") or 0, res.get("elapsed_ms") or 0))
                 else:
                     result["msg"] = ("每日活跃对话成功完成（网页通道失败：%s）"
                                      % res.get("error"))
+            # 只有真正计入官方「每日活跃」的网页通道成功了才算今天做过：网页腿失败时
+            # 若照写 lastDailyChat，当天后续巡检会直接跳过该账号，那天的 30/50 积分静默
+            # 丢掉且不再重试（面板还显示成功）。web=False（没开网页通道）时维持原
+            # 语义：桌面腿成功即算完成。
+            if web_ok:
+                self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    self.save(os.path.dirname(self.path))
             return result
         except urllib.error.HTTPError as exc:
             try:
@@ -1480,8 +1503,18 @@ class Account(object):
             return {"ok": (code == 0 or code == 10001), "code": code, "msg": msg, "data": payload.get("data")}
         except urllib.error.HTTPError as exc:
             try:
-                body = json.loads(exc.read().decode("utf-8") or "{}")
-                return {"ok": False, "error": body.get("msg") or ("HTTP %d" % exc.code)}
+                raw_b = exc.read().decode("utf-8") or "{}"
+                body = json.loads(raw_b)
+                code = body.get("code")
+                msg = body.get("msg") or ("HTTP %d" % exc.code)
+                # 上游如果在今日已签到时返回 HTTP 400 且 code 为 10001 / "今天已签到"
+                # 这说明今日事实上已经处于签到完成状态，按成功处理，并记录最后签到时间
+                if code == 10001 or "今天已签到" in msg or "已签到" in msg:
+                    self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+                    if self.path and os.path.exists(os.path.dirname(self.path)):
+                        self.save(os.path.dirname(self.path))
+                    return {"ok": True, "code": code, "msg": msg, "data": body.get("data")}
+                return {"ok": False, "error": msg}
             except Exception:
                 return {"ok": False, "error": "HTTP %d" % exc.code}
         except Exception as exc:
@@ -2365,6 +2398,9 @@ class AccountPool(object):
         # 这条偏好自己的平滑加权轮询累计值，键是 (uid, model)：与临期的
         # _expiry_weights 分开，两个偏好各自记各自的轮次。
         self._remaining_pick_state = {}
+        # 手动权重优先（面板按账号设置，weight > 1 才生效）的平滑加权轮询
+        # 累计值，键是 uid：与前两条偏好各自的轮次分开。派生值，不落盘。
+        self._manual_weights = {}
         # 页内轮转（超限对话）的每页游标，键是 (页号, 页大小)；整池轮转仍用
         # _cursor，两条轮转互不挪动对方的位置。派生值，不落盘。
         self._page_cursors = {}
@@ -2536,6 +2572,30 @@ class AccountPool(object):
             account.clear_error()
         account.save(self.dir)
         self.apply_proxy_slots()
+        return account.public()
+
+    def set_weight(self, uid, weight):
+        """设置账号的手动调度权重（1-100，1 = 不干预），落盘并回公共视图。"""
+        account = self.get(uid)
+        if account is None:
+            return None
+        try:
+            account.weight = max(1, min(100, int(weight)))
+        except (TypeError, ValueError):
+            return None
+        account.save(self.dir)
+        return account.public()
+
+    def set_note(self, uid, note):
+        """设置账号备注（面板标记「批量」/「自用」等），落盘并回公共视图。
+
+        空串 = 清除备注；与调度无关，纯展示。
+        """
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.note = str(note or "").strip()[:200]
+        account.save(self.dir)
         return account.public()
 
     def set_proxy(self, uid, proxy):
@@ -2820,6 +2880,14 @@ class AccountPool(object):
         # covers is unavailable right now - the pool falls back to the plain
         # round-robin it always had, so a single lapsed account can never wedge
         # the realm.
+        # 手动权重优先：面板给账号设了 >1 的权重时，这些账号先于一切自动
+        # 偏好接单，彼此之间按权重平滑加权轮询——权重高的先被选中、分到的
+        # 流量也多，但同层之内仍有轮转，谁也不独占。它们此刻都不可用（冷却、
+        # 限额、被排除）时照旧落回下面的自动偏好与轮询，一条偏好卡不住池子。
+        # 全部权重都是 1（默认）时这一层直接返回 None，分派与从前完全一致。
+        account = self._pick_weighted_first(snapshot, exclude, model)
+        if account is not None:
+            return account
         account = self._pick_expiring_first(snapshot, exclude, model)
         if account is not None:
             return account
@@ -2830,6 +2898,29 @@ class AccountPool(object):
         if account is not None:
             return account
         return self._rotate_pick(snapshot, exclude, model, cursor_key=page)
+
+    def _pick_weighted_first(self, snapshot, exclude, model):
+        """手动权重 > 1 的账号优先接单，或 None（没有可交的）。
+
+        与临期积分那条同款的两层结构，只是这层的权重来自用户在面板上的明确
+        设置，优先级也最高：权重是「我就想让这个号多用」的直接表达，不该被
+        自动偏好覆盖。同层之间按权重平滑加权轮询——两个高权重账号按权重比
+        分流量，它们与权重 1 的账号之间则是「先用完我再轮别人」。权重 1 的
+        账号完全不进这一层：临期积分、剩余用量这些自动子权重照旧在它们身上
+        生效，一行都不变。
+        """
+        ready = []
+        for account in snapshot:
+            if account.uid in exclude:
+                continue
+            if int(getattr(account, "weight", 1) or 1) <= 1:
+                continue
+            if not account.ready(model=model):
+                continue
+            ready.append((account, account.uid, int(account.weight)))
+        if not ready:
+            return None
+        return self._smooth_weighted_pick(ready, "_manual_weights")
 
     def _pick_expiring_first(self, snapshot, exclude, model):
         """Serve the in-window accounts first, or None when none can.

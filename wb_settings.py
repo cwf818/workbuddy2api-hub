@@ -101,6 +101,11 @@ UPDATE_CHECK_STATE_KEY = "update_check"
 # 取舍（那些组合会明显多接流量），所以老安装保持原样的纯轮询。
 REMAINING_PRIORITY_ENABLED_KEY = "remaining_priority_enabled"
 
+# 出口级瞬时失败退避（issue #271）：传输类失败与 502/503/504 不再进账号级熔断
+# 计数，改记在出口上、退避降到秒级（见 wb_egress）。缺失键读作关：它改变的是
+# 派发路径上的失败归账与退避尺度，老安装保持原样（传输错误仍喂账号熔断）。
+EGRESS_BACKOFF_ENABLED_KEY = "egress_backoff_enabled"
+
 _lock = threading.RLock()
 
 
@@ -1164,6 +1169,30 @@ def set_remaining_priority_enabled(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data[REMAINING_PRIORITY_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def egress_backoff_enabled(accounts_dir):
+    """Whether transient failures are accounted per egress instead of per account.
+
+    Off unless the operator turns it on. Turning it on changes how a transport
+    failure or a 502/503/504 is punished: it stops feeding the account breaker
+    (30 minutes, doubling to 6h) and instead grows a seconds-level backoff on the
+    outbound path the request actually used (see wb_egress). That is the fix for
+    issue #271 - a few seconds of link flakiness used to park healthy accounts
+    for half an hour - but it is a change to dispatch behaviour, so an install
+    that predates the switch keeps the old accounting.
+    """
+    return load(accounts_dir).get(EGRESS_BACKOFF_ENABLED_KEY) is True
+
+
+def set_egress_backoff_enabled(accounts_dir, enabled):
+    """Persist the egress-level backoff switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[EGRESS_BACKOFF_ENABLED_KEY] = enabled
         save(accounts_dir, data)
     return enabled
 

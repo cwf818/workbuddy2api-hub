@@ -62,7 +62,9 @@ wb_pricing.set_data_dir(USAGE_DIR)
 wb_pricing.set_settings_dir(ACCOUNTS_DIR)
 
 USAGE_LOG = P.USAGE_LOG
-CACHE = os.path.join(USAGE_DIR, "usage-aggregate-cache.json")
+# v4 布局：一类状态一份文件（usage-aggregate-cache-<kind>.json）。
+KIND_FILES = {kind: P._usage_cache_kind_path(kind)
+              for kind in P._USAGE_CACHE_KINDS}
 P._usage["started"] = FROZEN
 
 PASS = FAIL = 0
@@ -255,8 +257,7 @@ def restart():
     P._byacct_cache.update({"at": 0.0, "data": None})
     P._analytics_cache.clear()
     P._series_cache.clear()
-    P._usage_cache_loaded = False
-    P._usage_cache_read_result = None
+    P._usage_cache_forget()
     P._usage_cache_progress.clear()
     P._usage_cache_checkpointed.clear()
     P._usage_cache_last_attempt = time.time()
@@ -377,20 +378,40 @@ def run_child(extra_env=None):
 
 
 def cache_data():
-    with io.open(CACHE, encoding="utf-8") as fh:
-        return json.load(fh)
+    """五个 kind 文件的合并视图：{kind: entries}（缺失/读不出的当空表）。
+
+    与 v3 的单文件视图同形，用例里 data[kind] / days_path(...) 的写法不用改。
+    """
+    merged = {}
+    for kind in P._USAGE_CACHE_KINDS:
+        try:
+            with io.open(KIND_FILES[kind], encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            merged[kind] = []
+            continue
+        entries = data.get("entries") if isinstance(data, dict) else None
+        merged[kind] = entries if isinstance(entries, list) else []
+    return merged
 
 
 def save_cache(data):
-    io.open(CACHE, "w", encoding="utf-8", newline="\n").write(
-        json.dumps(data, ensure_ascii=False))
+    """把合并视图写回 kind 文件；空表不写文件（与生产侧写盘一致）。"""
+    for kind in P._USAGE_CACHE_KINDS:
+        entries = data.get(kind) or []
+        if not entries:
+            continue
+        payload = {"schema": P._USAGE_CACHE_SCHEMA, "kind": kind,
+                   "written_at": FROZEN, "entries": entries}
+        io.open(KIND_FILES[kind], "w", encoding="utf-8", newline="\n").write(
+            json.dumps(payload, ensure_ascii=False))
 
 
 def make_checkpoint():
     cache_env_force()
     restart()
     live()
-    return os.path.exists(CACHE)
+    return any(os.path.exists(path) for path in KIND_FILES.values())
 
 
 def days_path(data, kind, realm=None):
@@ -555,8 +576,11 @@ print()
 print("[4] checkpoint：日桶随状态落盘/加载，重启后逐字节一致")
 check("写盘成功", make_checkpoint())
 stored = cache_data()
-check("checkpoint 是 schema=3 的 JSON 对象", stored.get("schema") == 3,
-      stored.get("schema"))
+check("每个 kind 文件都是 schema=当前版本（v4）的 JSON 对象",
+      all(json.load(io.open(KIND_FILES[k], encoding="utf-8"))["schema"]
+          == P._USAGE_CACHE_SCHEMA and P._USAGE_CACHE_SCHEMA == 4
+          for k in P._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])),
+      P._USAGE_CACHE_SCHEMA)
 check("四个 kinds 都在",
       all(len(stored[k]) >= 1 for k in
           ("snapshot", "analytics", "series", "by_account")),
@@ -622,6 +646,32 @@ def mutate(mutate_fn, label, kind="snapshot"):
     check(label, got == GOLDEN, first_diff(GOLDEN, got))
 
 
+def mutate_schema(mutate_fn, label):
+    """把每个 kind 文件的顶层形状改坏（v4 之前是「旧文件整体作废」）。
+
+    标记照旧落在 snapshot 今天的日桶里：文件被拒 → 结果回到真值；万一被
+    放行，结果里就会多出 1000 次请求。改坏的是文件顶层（schema 等），不是
+    载荷，所以这一份必须整体不被采用。
+    """
+    make_checkpoint()
+    data = cache_data()
+    newest_day(data, "snapshot")["requests"] += 1000
+    save_cache(data)
+    for kind in P._USAGE_CACHE_KINDS:
+        path = KIND_FILES[kind]
+        if not os.path.exists(path):
+            continue
+        with io.open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        mutate_fn(raw)
+        io.open(path, "w", encoding="utf-8", newline="\n").write(
+            json.dumps(raw, ensure_ascii=False))
+    cache_env_nowrite()
+    restart()
+    got = canon(live())
+    check(label, got == GOLDEN, first_diff(GOLDEN, got))
+
+
 # 6.0 自检：形状合法、值被改过的日桶会被采用（标记必须可见），否则下面的
 # 用例可能什么都没测到。
 make_checkpoint()
@@ -675,9 +725,9 @@ mutate(lambda d: newest_day(d, "series")["hours"].__setitem__(
     "series 的小时子桶 at 不是数字", kind="series")
 
 # 6.2 schema：旧文件整体作废（一次性全量重扫，结果正确）
-mutate(lambda d: d.update({"schema": 2}), "旧 schema（v2，没有日桶）")
-mutate(lambda d: d.update({"schema": 4}), "未来的 schema")
-mutate(lambda d: d.update({"schema": True}), "schema 写成 true")
+mutate_schema(lambda d: d.update({"schema": 2}), "旧 schema（v2，没有日桶）")
+mutate_schema(lambda d: d.update({"schema": 5}), "未来的 schema")
+mutate_schema(lambda d: d.update({"schema": True}), "schema 写成 true")
 
 print()
 print("[7] 剪枝：保留天数以外的天被丢掉，够不到的窗口退回扫描")

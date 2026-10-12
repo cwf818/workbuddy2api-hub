@@ -9,7 +9,9 @@
   3. estimate_tokens 的单遍实现与原来的逐字符循环逐值相等（含 CJK 边界、代理对、
      非字符串输入）；
   4. wb_settings.load 的 (path, mtime, size) 缓存：外部改写后失效、save() 写后
-     立即可见（含 limits_data 首读迁移的写）、返回的是顶层拷贝。
+     立即可见（含 limits_data 首读迁移的写）、返回的是顶层拷贝；
+  5. 模块级 _usage 只剩进程启动时刻：record_usage/record_error 不再累加没人读的
+     requests/ttft/gen/wall/by_model，快照的 started/since 仍从它取。
 """
 import json
 import os
@@ -17,6 +19,7 @@ import random
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -224,6 +227,32 @@ class EstimateTokensTests(unittest.TestCase):
         outside = "\u33ff\u4dc0\ua000 ab"
         self.assertEqual(len(P.CJK_RE.sub("", inside)), 0)
         self.assertEqual(P.CJK_RE.sub("", outside), outside)
+
+
+class UsageCounterTests(unittest.TestCase):
+    """_usage 只剩进程启动时刻：请求路径不再维护没人读的进程级累计。
+
+    record_usage/record_error 曾经每请求往模块级 _usage 里累加 requests /
+    令牌 / ttft / gen / wall / by_model，而全仓唯一的读者是快照的
+    _usage["started"]。钉住：只留 started、请求不改它、快照的 started/since
+    仍然从它取（口径一行未变）。
+    """
+
+    def test_usage_holds_only_the_start_marker(self):
+        started = P._usage["started"]
+        P.record_usage("m-1", {"prompt_tokens": 10, "completion_tokens": 5,
+                               "total_tokens": 15}, stream=True, elapsed_ms=1200,
+                       ttft_ms=300, gen_ms=900, account=None)
+        P.record_error("m-1", 500, "boom", elapsed_ms=200)
+        self.assertEqual(P._usage, {"started": started})
+
+    def test_snapshot_started_and_since_come_from_it(self):
+        P._usage["started"] = 1791445200.0
+        snap = P.usage_snapshot(realm=None, ttl=0)
+        self.assertEqual(snap["started"], 1791445200.0)
+        self.assertEqual(snap["since"],
+                         time.strftime("%Y-%m-%d %H:%M:%S",
+                                       time.localtime(1791445200.0)))
 
 
 class JsonSpy(object):

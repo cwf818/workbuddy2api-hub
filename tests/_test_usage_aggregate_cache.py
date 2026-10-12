@@ -2,8 +2,12 @@
 
 PR #189 把面板的 all-time 聚合改成按字节偏移增量折叠，但状态只在进程内存
 里：服务一重启，第一次刷新仍是全量扫描，而日志每天涨一万多行，冷扫描成本
-跟着线性上升。这一套把三份状态（snapshot / by_account / analytics 的
+跟着线性上升。这一套把几份状态（snapshot / by_account / analytics 的
 all-time 折叠）连同位置信息落盘到数据目录，重启后第一次刷新只读新增字节。
+
+v4 起一类状态一份文件（usage-aggregate-cache-<kind>.json）：这一套按新的
+文件布局读写；升级前单文件（v3）的只读兼容由 _test_usage_cache_kinds.py
+钉住。
 
 这个套件钉住的是「checkpoint 只是加速」这条底线：
 
@@ -63,7 +67,10 @@ wb_pricing.set_data_dir(USAGE_DIR)
 wb_pricing.set_settings_dir(ACCOUNTS_DIR)
 
 USAGE_LOG = P.USAGE_LOG
-CACHE = os.path.join(USAGE_DIR, "usage-aggregate-cache.json")
+# v4 布局：一类状态一份文件。套件按 kind 读写这些文件，个别用例还会直接
+# 改坏某一类的文件来验证「一类坏不影响其余类」。
+KIND_FILES = {kind: P._usage_cache_kind_path(kind)
+              for kind in P._USAGE_CACHE_KINDS}
 # snapshot 的结果里带着进程自己的 _usage["started"]，冻结它让父进程与子进程
 # 的输出可比。
 P._usage["started"] = FROZEN
@@ -296,8 +303,7 @@ def restart():
     P._snap_cache.clear()
     P._byacct_cache.update({"at": 0.0, "data": None})
     P._analytics_cache.clear()
-    P._usage_cache_loaded = False
-    P._usage_cache_read_result = None
+    P._usage_cache_forget()
     P._usage_cache_progress.clear()
     P._usage_cache_checkpointed.clear()
     P._usage_cache_last_attempt = time.time()
@@ -355,22 +361,71 @@ def run_child(extra_env=None):
     return payload["results"], payload["checkpointed"]
 
 
+def cache_files():
+    """当前存在的 kind 文件路径列表。"""
+    return [path for path in KIND_FILES.values() if os.path.exists(path)]
+
+
+def no_cache_files():
+    """一个 kind 文件都没有（等价于「没有 checkpoint」）。"""
+    return not cache_files()
+
+
 def make_checkpoint():
     """在当前日志上折一遍并强制落盘。"""
     cache_env_force()
     restart()
     live()
-    return os.path.exists(CACHE)
+    return bool(cache_files())
 
 
 def cache_data():
-    with io.open(CACHE, encoding="utf-8") as fh:
-        return json.load(fh)
+    """五个 kind 文件的合并视图：{kind: entries}（缺失/读不出的当空表）。
+
+    与 v3 的单文件视图同形，用例里 _entry(data, kind, realm) 的写法不用改。
+    """
+    merged = {}
+    for kind in P._USAGE_CACHE_KINDS:
+        try:
+            with io.open(KIND_FILES[kind], encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            merged[kind] = []
+            continue
+        entries = data.get("entries") if isinstance(data, dict) else None
+        merged[kind] = entries if isinstance(entries, list) else []
+    return merged
 
 
 def save_cache(data):
-    io.open(CACHE, "w", encoding="utf-8", newline="\n").write(
+    """把合并视图写回 kind 文件（保持 v4 的包装形状）。
+
+    空表不写文件——与生产侧的写盘一致（没内容的类不落盘）。
+    """
+    for kind in P._USAGE_CACHE_KINDS:
+        entries = data.get(kind) or []
+        if not entries:
+            continue
+        payload = {"schema": P._USAGE_CACHE_SCHEMA, "kind": kind,
+                   "written_at": FROZEN, "entries": entries}
+        io.open(KIND_FILES[kind], "w", encoding="utf-8", newline="\n").write(
+            json.dumps(payload, ensure_ascii=False))
+
+
+def kind_file_data(kind):
+    """某个 kind 文件的原始 JSON（顶层形状校验用）。"""
+    with io.open(KIND_FILES[kind], encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save_kind_file(kind, data):
+    io.open(KIND_FILES[kind], "w", encoding="utf-8", newline="\n").write(
         json.dumps(data, ensure_ascii=False))
+
+
+def clear_cache_files():
+    for path in cache_files():
+        os.unlink(path)
 
 
 def _entry(data, kind, realm=None):
@@ -402,27 +457,37 @@ check("基线：realm 过滤真的在起作用（intl/cn 的请求数不同）",
       GOLDEN_OBJ["snap_intl"]["requests"] != GOLDEN_OBJ["snap_cn"]["requests"],
       (GOLDEN_OBJ["snap_intl"]["requests"], GOLDEN_OBJ["snap_cn"]["requests"]))
 check("基线：关掉开关时连文件都不写",
-      not os.path.exists(CACHE), os.listdir(USAGE_DIR))
+      no_cache_files(), os.listdir(USAGE_DIR))
 
 print()
 print("[1] 往返：写盘 → 模拟重启加载 → 与不落盘逐字节一致（含键顺序）")
 check("写盘成功", make_checkpoint())
 stored = cache_data()
-check("checkpoint 是一个 schema=当前版本的 JSON 对象（v3 起带按日分桶）",
-      isinstance(stored, dict) and stored.get("schema") == P._USAGE_CACHE_SCHEMA
-      and stored.get("schema") == 3,
-      stored.get("schema"))
+check("每个写出的 kind 文件都是 schema=当前版本、kind 标签正确的 JSON 对象",
+      all(kind_file_data(k)["schema"] == P._USAGE_CACHE_SCHEMA
+          and kind_file_data(k)["kind"] == k
+          and isinstance(kind_file_data(k)["entries"], list)
+          for k in P._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])),
+      {k: (kind_file_data(k).get("schema"), kind_file_data(k).get("kind"))
+       for k in P._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])})
+check("schema 版本是 v4（一类一份的布局）",
+      P._USAGE_CACHE_SCHEMA == 4, P._USAGE_CACHE_SCHEMA)
 check("三份状态都写进去了（每个 realm 一份）",
       len(stored["snapshot"]) == 3 and len(stored["by_account"]) == 1
       and len(stored["analytics"]) == 3,
-      {k: len(v) for k, v in stored.items() if isinstance(v, list)})
+      {k: len(v) for k, v in stored.items()})
+check("没折过的两类（series / remaining）不写文件",
+      not os.path.exists(KIND_FILES["series"])
+      and not os.path.exists(KIND_FILES["remaining"]),
+      cache_files())
 check("realm 标签跟着状态一起落盘（null 表示不限 realm）",
       sorted([e["realm"] if e["realm"] is not None else "all"
               for e in stored["snapshot"]]) == ["all", "cn", "intl"],
       [e["realm"] for e in stored["snapshot"]])
 check("by_account 那份不带 realm 轴", "realm" not in stored["by_account"][0])
 check("写盘是原子替换：没有留下临时文件",
-      not os.path.exists(CACHE + ".tmp"), os.listdir(USAGE_DIR))
+      not [n for n in os.listdir(USAGE_DIR) if n.endswith(".tmp")],
+      os.listdir(USAGE_DIR))
 # 落盘时不能排序：文件里的键序必须是折叠的插入顺序。排序（v1 的 sort_keys）
 # 会让加载回来的一切变成字母序，响应字节随之与冷启动不同。
 stored_keys = list(_entry(stored, "snapshot", None)["snap"].keys())
@@ -543,44 +608,77 @@ def mutate_cache(mutate, label, kind="snapshot", realm=None):
     check(label, got == GOLDEN, err or first_diff(GOLDEN, got or ""))
 
 
-# 4.1 文件本身读不出来
+def mutate_kind_file(kind, mutate, label, others=("analytics", "by_account")):
+    """改坏某个 kind 文件的顶层形状，再从它加载。
+
+    该类的状态必须被拒、结果回到真值，而其余类照常被采用——一类文件坏了不
+    拖累其余类，这是 v4 拆文件的直接承诺。
+    """
+    make_checkpoint()
+    data = kind_file_data(kind)
+    mutate(data)
+    save_kind_file(kind, data)
+    cache_env_nowrite()
+    restart()
+    got, err = live_canon()
+    check(label, got == GOLDEN, err or first_diff(GOLDEN, got or ""))
+    if others:
+        check(label + "：其余类照常采用",
+              all(k in P._usage_cache_checkpointed for k in others),
+              P._usage_cache_checkpointed)
+
+
+# 4.1 文件本身读不出来（五个 kind 文件一起改坏：等于「没有任何 checkpoint」）
 make_checkpoint()
-io.open(CACHE, "wb").write(b"{this is not json")
+for path in cache_files():
+    io.open(path, "wb").write(b"{this is not json")
 cache_env_nowrite()
 restart()
 check("损坏 JSON：结果回到真值", canon(live()) == GOLDEN)
 make_checkpoint()
-raw = io.open(CACHE, "rb").read()
-io.open(CACHE, "wb").write(raw[:40] + b"\x00\xff\xfe" + raw[60:])
+for path in cache_files():
+    raw = io.open(path, "rb").read()
+    io.open(path, "wb").write(raw[:40] + b"\x00\xff\xfe" + raw[60:])
 restart()
 check("二进制乱码：结果回到真值", canon(live()) == GOLDEN)
 make_checkpoint()
-text = io.open(CACHE, encoding="utf-8").read()
-io.open(CACHE, "w", encoding="utf-8").write(text[:len(text) // 2])
+for path in cache_files():
+    text = io.open(path, encoding="utf-8").read()
+    io.open(path, "w", encoding="utf-8").write(text[:len(text) // 2])
 restart()
 check("截断文件：结果回到真值", canon(live()) == GOLDEN)
 make_checkpoint()
-io.open(CACHE, "w", encoding="utf-8").write("[1, 2, 3]")
+for path in cache_files():
+    io.open(path, "w", encoding="utf-8").write("[1, 2, 3]")
 restart()
 check("顶层不是对象：结果回到真值", canon(live()) == GOLDEN)
 make_checkpoint()
-io.open(CACHE, "w", encoding="utf-8").write("")
+for path in cache_files():
+    io.open(path, "w", encoding="utf-8").write("")
 restart()
 check("空文件：结果回到真值", canon(live()) == GOLDEN)
-os.unlink(CACHE)
+clear_cache_files()
 restart()
 check("文件不存在：结果回到真值", canon(live()) == GOLDEN)
 
-# 4.2 schema
-mutate_cache(lambda d: d.update({"schema": 4}), "schema 版本不符（比当前新）")
-mutate_cache(lambda d: d.update({"schema": 2}),
-             "旧 schema（v2 没有按日分桶）")
-mutate_cache(lambda d: d.update({"schema": 1}),
-             "旧 schema（v1 用 sort_keys 写盘，键序不是折叠序）")
-mutate_cache(lambda d: d.update({"schema": True}),
-             "schema 写成 true（Python 里 True == 1）")
-mutate_cache(lambda d: d.pop("schema"), "schema 缺失")
-mutate_cache(lambda d: d.update({"schema": "2"}), "schema 写成字符串")
+# 4.2 schema 与顶层形状（按类分别校验：坏一份只作废一份）
+mutate_kind_file("snapshot", lambda d: d.update({"schema": 5}),
+                 "schema 版本不符（比当前新）")
+mutate_kind_file("snapshot", lambda d: d.update({"schema": 3}),
+                 "旧 schema（v3 单文件布局，条目结构相同也不放行）")
+mutate_kind_file("snapshot", lambda d: d.update({"schema": 2}),
+                 "旧 schema（v2 没有按日分桶）")
+mutate_kind_file("snapshot", lambda d: d.update({"schema": True}),
+                 "schema 写成 true（Python 里 True == 1）")
+mutate_kind_file("snapshot", lambda d: d.pop("schema"), "schema 缺失")
+mutate_kind_file("snapshot", lambda d: d.update({"schema": "4"}),
+                 "schema 写成字符串")
+mutate_kind_file("snapshot", lambda d: d.update({"kind": "analytics"}),
+                 "kind 标签与文件名不符")
+mutate_kind_file("snapshot", lambda d: d.pop("kind"), "kind 标签缺失")
+mutate_kind_file("snapshot", lambda d: d.update({"entries": {}}),
+                 "entries 不是列表")
+mutate_kind_file("snapshot", lambda d: d.pop("entries"), "entries 缺失")
 
 # 4.3 位置：offset / key / tail
 mutate_cache(lambda d: _entry(d, "snapshot").update({"offset": 10 ** 9}),
@@ -766,20 +864,31 @@ print()
 print("[5] 目录不可写 / 被占位：不能崩，结果正确")
 cache_env_force()
 restart()
+real_kind_path = P._usage_cache_kind_path
 real_path = P._usage_cache_path
-missing_dir = os.path.join(_TMP, "no-such-dir", "usage-aggregate-cache.json")
-P._usage_cache_path = lambda: missing_dir
+missing_dir = os.path.join(_TMP, "no-such-dir")
+
+
+def _missing_kind_path(kind):
+    return os.path.join(missing_dir, "usage-aggregate-cache-%s.json" % kind)
+
+
+P._usage_cache_kind_path = _missing_kind_path
+P._usage_cache_path = lambda: os.path.join(missing_dir,
+                                           "usage-aggregate-cache.json")
 try:
     got, err = live_canon()
     check("写盘路径不可用：不抛错、结果正确", got == GOLDEN,
           err or first_diff(GOLDEN, got or ""))
     check("写盘路径不可用：没有创建任何文件", not os.path.exists(missing_dir))
 finally:
+    P._usage_cache_kind_path = real_kind_path
     P._usage_cache_path = real_path
 # 读路径被目录占位（open 会抛 OSError，必须被吞掉）
 make_checkpoint()
-os.unlink(CACHE)
-os.makedirs(CACHE)
+clear_cache_files()
+os.makedirs(KIND_FILES["snapshot"])
+os.makedirs(KIND_FILES["analytics"])
 try:
     cache_env_force()
     restart()
@@ -787,7 +896,8 @@ try:
     check("读盘路径被目录占位：不抛错、结果正确", got == GOLDEN,
           err or first_diff(GOLDEN, got or ""))
 finally:
-    os.rmdir(CACHE)
+    os.rmdir(KIND_FILES["snapshot"])
+    os.rmdir(KIND_FILES["analytics"])
 make_checkpoint()          # 恢复一份干净 checkpoint
 
 print()
@@ -810,70 +920,70 @@ got = json.loads(got) if got else {}
 check("关掉开关：被改过的 checkpoint 完全不被读，结果回到真值",
       got.get("snap", {}).get("requests") == GOLDEN_OBJ["snap"]["requests"],
       (got.get("snap", {}).get("requests"), GOLDEN_OBJ["snap"]["requests"]))
-check("关掉开关：也不会写盘", not os.path.exists(CACHE + ".tmp"))
+check("关掉开关：也不会写盘",
+      not [n for n in os.listdir(USAGE_DIR) if n.endswith(".tmp")])
 
 print()
 print("[7] 节流：默认阈值下连续刷新不写文件")
-if os.path.exists(CACHE):
-    os.unlink(CACHE)
+clear_cache_files()
 cache_env(enabled=1)                     # 默认 1MB / 900s
 restart()
 live()
-check("默认阈值 + 首折（不到 1MB）：不写", not os.path.exists(CACHE))
+check("默认阈值 + 首折（不到 1MB）：不写", no_cache_files())
 for _ in range(3):
     live()
-check("默认阈值下连续刷新：一直不写", not os.path.exists(CACHE))
+check("默认阈值下连续刷新：一直不写", no_cache_files())
 cache_env(enabled=1, min_bytes=100, min_seconds=10 ** 9)
 restart()
 live()
-check("推进超过 100 字节：写一次", os.path.exists(CACHE))
-os.unlink(CACHE)
+check("推进超过 100 字节：写一次", bool(cache_files()))
+clear_cache_files()
 live()
-check("没有新字节：不再写（文件被删掉也不补写）", not os.path.exists(CACHE))
+check("没有新字节：不再写（文件被删掉也不补写）", no_cache_files())
 cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=0)
 restart()
 live()
-check("计时器到点 + 从零折满（确有推进）：写一次", os.path.exists(CACHE))
-with io.open(CACHE, encoding="utf-8") as fh:
-    check("写出来的还是完整的 checkpoint",
-          json.load(fh).get("schema") == P._USAGE_CACHE_SCHEMA)
+check("计时器到点 + 从零折满（确有推进）：写一次", bool(cache_files()))
+check("写出来的还是完整的 checkpoint（每份自带 schema 与 kind 标签）",
+      all(kind_file_data(k)["schema"] == P._USAGE_CACHE_SCHEMA
+          and kind_file_data(k)["kind"] == k
+          for k in P._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])))
 
 # 空闲不重写（本节的靶子）：进度已对齐到 checkpoint，等满一个时间窗口后再
 # 刷新，日志没有新字节 → 不许再写。旧行为：计时器到点就无条件写一份逐字节
 # 相同的 checkpoint，面板开着等于每 900s 白写一份 120KB（纯写放大）。
 cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=900)
-before = os.stat(CACHE).st_mtime_ns
+before = os.stat(KIND_FILES["snapshot"]).st_mtime_ns
 P._usage_cache_last_attempt -= 901
 live()
 check("计时器到点 + 无推进：不写（空闲不重写）",
-      os.stat(CACHE).st_mtime_ns == before)
+      os.stat(KIND_FILES["snapshot"]).st_mtime_ns == before)
 # 同一件事从真实调用路径再走一遍：无新字节的 usage_snapshot(range="today")
 # 是面板轮询每几秒就碰一次的路径（日桶半 → _usage_cache_maybe_save）。
 P._usage_cache_last_attempt -= 901
 P.usage_snapshot(range="today", ttl=0)
 check("无新字节的 usage_snapshot(range=today) 不重写 checkpoint",
-      os.stat(CACHE).st_mtime_ns == before)
+      os.stat(KIND_FILES["snapshot"]).st_mtime_ns == before)
 # 有推进（不足字节阈值）：计时器分支照常写——修的是空闲重写，不是计时器
 append_log([row(FROZEN - 100, "m-a", "u1", 500, 50)])
 P._usage_cache_last_attempt -= 901
 live()
 check("计时器到点 + 有新字节（不足字节阈值）：写一次",
-      os.stat(CACHE).st_mtime_ns != before)
+      os.stat(KIND_FILES["snapshot"]).st_mtime_ns != before)
 write_log(ROWS)                          # 恢复基线日志，后续用例共用它
 
 # 加载之后不产生「白写」：采用 checkpoint 会把节流基线对齐到加载的 offset
 cache_env(enabled=1)                     # 默认阈值
-before = os.stat(CACHE).st_mtime_ns
+before = os.stat(KIND_FILES["snapshot"]).st_mtime_ns
 restart()
 live()
 check("重启加载后（默认阈值）不会重写一份内容相同的文件",
-      os.stat(CACHE).st_mtime_ns == before)
+      os.stat(KIND_FILES["snapshot"]).st_mtime_ns == before)
 cache_env_off()
-if os.path.exists(CACHE):
-    os.unlink(CACHE)
+clear_cache_files()
 restart()
 live()
-check("开关关闭 + 阈值全 0：仍然不写", not os.path.exists(CACHE))
+check("开关关闭 + 阈值全 0：仍然不写", no_cache_files())
 
 print()
 print("[8] 幂等：同一份 checkpoint 只被采用一次")
@@ -968,16 +1078,14 @@ try:
           P._realm_inputs() != fp_loaded, P._realm_inputs())
     check("池还停在旧归属（磁盘与池不一致）",
           not P._realm_fold_reproducible(P._account_realm_map()))
-    if os.path.exists(CACHE):
-        os.unlink(CACHE)
+    clear_cache_files()
     cache_env_force()
     restart()
     live()
-    written = cache_data() if os.path.exists(CACHE) else {
-        "snapshot": [], "by_account": [], "analytics": []}
+    written = cache_data()
     check("池没跟上磁盘时 snapshot/analytics 不写（by_account 照写，它不读归属）",
           written["snapshot"] == [] and written["analytics"] == [],
-          {k: len(v) for k, v in written.items() if isinstance(v, list)})
+          {k: len(v) for k, v in written.items()})
     write_account("u-2", "cn")          # 改回来
     cache_env_off()
     restart()
@@ -986,16 +1094,14 @@ try:
     # 池整个不存在而磁盘上有账号：折叠根本不查账号映射，这种折叠冷进程复现
     # 不了 —— 宁可不信任、不写，等池就绪后再用。
     P.POOL = None
-    if os.path.exists(CACHE):
-        os.unlink(CACHE)
+    clear_cache_files()
     cache_env_force()
     restart()
     live()
-    written = cache_data() if os.path.exists(CACHE) else {
-        "snapshot": [], "by_account": [], "analytics": []}
+    written = cache_data()
     check("没有池而磁盘上有账号：snapshot/analytics 不写",
           written["snapshot"] == [] and written["analytics"] == [],
-          {k: len(v) for k, v in written.items() if isinstance(v, list)})
+          {k: len(v) for k, v in written.items()})
 finally:
     P.ACCOUNTS_DIR = SAVED_DIR
     P.POOL = SAVED_POOL

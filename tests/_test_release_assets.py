@@ -251,6 +251,21 @@ class ManifestTests(unittest.TestCase):
                      "start-wb-proxy.command", "start-wb-proxy-lan.sh"):
             self.assertIn(name, listed)
 
+    def test_every_launcher_script_is_listed(self):
+        """启动脚本按前缀全量扫：漏登记一个就在这儿红。
+
+        #285 的教训：portable.txt 里 start-wb-proxy-lan.bat 被 restart-wb-proxy.bat
+        顶掉了，而新脚本恰恰要调用它——便携包少了这个文件，Windows 的 LAN 启动与
+        重启都会失败。上面那份手写清单只点了 .sh 的名，所以没拦住。
+        quick-deploy.sh 是 Docker 路径、刻意不进便携包，不在前缀里。
+        """
+        listed = tools.read_manifest()
+        for prefix in ("start-wb-proxy", "restart-wb-proxy", "allow-firewall"):
+            for path in sorted(glob.glob(os.path.join(ROOT, prefix + "*"))):
+                name = os.path.basename(path)
+                if name.endswith((".bat", ".sh", ".command")):
+                    self.assertIn(name, listed, "便携包清单缺少 %s" % name)
+
     def test_runtime_data_files_are_listed(self):
         # wb_pricing._candidate_file() prefers pricing/pricing.json over the
         # copy inlined in the module, so a package without it silently ships

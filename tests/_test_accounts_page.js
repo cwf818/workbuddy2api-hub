@@ -121,13 +121,47 @@ assert.ok(/postJSON\('\/settings\/save', \{accounts_separate_tab: value\}\)/.tes
 assert.ok(/if\(tab === 'accounts' && !_accountsSeparateTab\) tab = 'gateway';/.test(script),
   '合并模式下 ?tab=accounts 应退回「网关与账号」页');
 
+/* ---- 1c. 一键切换所有出站身份 --------------------------------------- */
+
+// 按钮在账号工具栏里，紧跟「一键分配代理」
+assert.ok(/id="btnProductAll"[^>]*onclick="cycleAllProducts\(this\)"/.test(html),
+  '账号工具栏缺少「一键切换所有出站身份」按钮');
+assert.ok(/一键分配代理<\/button>\s*<button class="sec" id="btnProductAll"/.test(html),
+  '按钮应排在「一键分配代理」之后');
+// 当前身分要有个能定位的节点，不能只留一段裸文本（否则 JS 改不动它）
+assert.ok(html.includes('<span id="productAllLabel">'), '按钮上的当前身分缺少可定位节点');
+// 批量靠「不带 uid」：带上 uid 就退化成单账号切换
+assert.ok(/postJSON\('\/accounts\/product', \{product: next\}\)/.test(script),
+  '批量切换只应提交 product，不能带 uid');
+// 身分取值与轮转顺序必须与服务端 wb_identity.VALID_PRODUCTS 一致
+assert.ok(/PRODUCT_ORDER = \['workbuddy', 'vscode', 'cli'\]/.test(script),
+  '轮转顺序应与服务端身分取值一致');
+// 各账号身分不一致时不能显示成其中某一种
+assert.ok(/cur \? PRODUCT_SHORT\[cur\] : '混合'/.test(script),
+  '身分不一致时应显示「混合」');
+// 英文词条齐全，否则切到 EN 时这一块是中文
+for(const [zh, en] of [['一键切换所有出站身份：', 'Switch all outbound identities: '],
+                       ['混合', 'mixed'],
+                       ['将把全部账号的出站身份切换为 ', 'Switch the outbound identity of ALL accounts to '],
+                       ['？（含另一个版本）', '? (including the other version)'],
+                       ['已把全部账号的出站身份切换为 ', 'Switched the outbound identity of ALL accounts to ']]){
+  assert.ok(html.includes("'" + zh + "': '" + en + "'"),
+    'DICT 里缺少「' + zh + '」的英文词条');
+}
+
+
 /* ---- 2. 行为：拼查询串、渲染、翻页、出错 ---------------------------- */
 
+let POSTS = [];
 let REQUESTS = [];
 let RESPONSE = {rows: [], total: 0};
 let FETCH_FAILS = false;
 dom.installDom({
-  fetch: (url) => {
+  confirm: () => true,
+  fetch: (url, opts) => {
+    if(opts && opts.method === 'POST'){
+      POSTS.push({url: String(url), body: String(opts.body || '')});
+    }
     REQUESTS.push(String(url));
     if(FETCH_FAILS){
       return Promise.resolve({ok: false, status: 400,
@@ -149,6 +183,8 @@ try {
       switchMainTab: switchMainTab,
       applyAccountsTabLayout: applyAccountsTabLayout,
       accountsSeparateTab: accountsSeparateTab,
+      updateProductAllButton: updateProductAllButton,
+      cycleAllProducts: cycleAllProducts,
     };`)();
 } catch(e) {
   console.log = realLog;
@@ -325,6 +361,49 @@ function check(label, ok, detail){
   check('拆开后网关页签改回「网关」', el('navGatewayLabel').textContent === '网关',
     el('navGatewayLabel').textContent);
   check('拆开后开关读回来是开', api.accountsSeparateTab() === true);
+
+  // 2k. 一键切换所有出站身份：按钮显示当前身分，点一下切到下一个并提交全量
+  window.ACCOUNTS = [{uid: 'u1', product: 'workbuddy'}, {uid: 'u2', product: 'workbuddy'}];
+  api.updateProductAllButton();
+  check('身分一致时按钮显示该身分', el('productAllLabel').textContent === 'WB',
+    el('productAllLabel').textContent);
+
+  window.ACCOUNTS = [{uid: 'u1', product: 'workbuddy'}, {uid: 'u2', product: 'cli'}];
+  api.updateProductAllButton();
+  check('身分不一致时显示「混合」', el('productAllLabel').textContent === '混合',
+    el('productAllLabel').textContent);
+  // 缺 product 字段的账号按 WB 算（与行内按钮的判定一致）
+  window.ACCOUNTS = [{uid: 'u1'}, {uid: 'u2', product: 'workbuddy'}];
+  api.updateProductAllButton();
+  check('缺 product 字段按 WB 算', el('productAllLabel').textContent === 'WB',
+    el('productAllLabel').textContent);
+
+  // 混合时点一下 = 统一到轮转的第一项
+  window.ACCOUNTS = [{uid: 'u1', product: 'workbuddy'}, {uid: 'u2', product: 'cli'}];
+  RESPONSE = {accounts: [], rows: [], total: 0};
+  POSTS = [];
+  await api.cycleAllProducts(null);
+  check('混合时切到 WB',
+    POSTS.length === 1 && POSTS[0].url === '/accounts/product'
+    && JSON.parse(POSTS[0].body).product === 'workbuddy', JSON.stringify(POSTS));
+
+  // 一致时按 WB -> VSC -> CLI -> WB 轮转，且不带 uid
+  for(const [from, to] of [['workbuddy', 'vscode'], ['vscode', 'cli'], ['cli', 'workbuddy']]){
+    window.ACCOUNTS = [{uid: 'u1', product: from}, {uid: 'u2', product: from}];
+    POSTS = [];
+    await api.cycleAllProducts(null);
+    const body = POSTS.length === 1 ? JSON.parse(POSTS[0].body) : {};
+    check(from + ' 之后切到 ' + to,
+      POSTS.length === 1 && POSTS[0].url === '/accounts/product'
+      && body.product === to && body.uid === undefined, JSON.stringify(POSTS));
+  }
+
+  // 一个账号都没有时不发请求（服务端全量切换等于空转）
+  window.ACCOUNTS = [];
+  POSTS = [];
+  await api.cycleAllProducts(null);
+  check('没有账号时不发请求', POSTS.length === 0, JSON.stringify(POSTS));
+
 
   console.log = realLog;
   console.log('ok - accounts page & activity history (structure + behaviour)');

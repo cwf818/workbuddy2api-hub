@@ -903,6 +903,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '出站身份：': 'Outbound identity:',
     '分配代理出口给未绑定账号': 'Assign proxy exits to unbound accounts',
     '一键分配代理': 'Assign proxy exits',
+    '一键切换所有出站身份：': 'Switch all outbound identities: ',
+    '混合': 'mixed',
     '分钟': 'minutes',
     '分钟)': 'min)',
     '分钟取一次价': 'minutes per price fetch',
@@ -1047,6 +1049,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '将覆盖': 'Will overwrite',
     '将覆盖同 UID 的现有账号（含其凭证），确定继续？': 'Existing accounts with the same UID, including their credentials, will be overwritten. Continue?',
     '将该账号的出站身份切换为': 'Switch the outbound identity of this account to',
+    '将把全部账号的出站身份切换为 ': 'Switch the outbound identity of ALL accounts to ',
+    '？（含另一个版本）': '? (including the other version)',
+    '把全部账号（含另一个版本）的出站身份切到下一个：WB → VSC → CLI': 'Switch every account (both versions) to the next outbound identity: WB → VSC → CLI',
     '将跳过': 'Will skip',
     '尚未选择文件。': 'No file selected yet.',
     '就绪': 'Ready',
@@ -1061,6 +1066,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '已保存': 'Saved',
     '已停用': 'Disabled',
     '已全部停用所有账号': 'All accounts disabled',
+    '已把全部账号的出站身份切换为 ': 'Switched the outbound identity of ALL accounts to ',
     '已全部启用所有账号': 'All accounts enabled',
     '已关闭保留积分': 'Reserved credits off',
     '已关闭变体继承：带后缀的名字不再自动取价': 'Variant inheritance off: suffixed names are no longer priced automatically',
@@ -1236,6 +1242,19 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '最低保留积分': 'Minimum reserved credits',
     '最大输出': 'Max output',
     '最快到期优先': 'Expiring soonest first',
+    '出口级瞬时失败退避': 'Egress-level transient backoff',
+    '启用出口级退避': 'Enable egress backoff',
+    '传输类失败与 502/503/504 改记在「出口」而不是账号上：同一个出口的账号共用一个计数器，退避是秒级（1 秒起、翻倍、封顶 15 秒、带抖动），任一次成功即清零；账号级熔断（30 分钟起、翻倍到 6 小时）不再被一次链路抖动触发。500 与 401/403/429 仍走原路径。默认关闭。': 'Transport failures and 502/503/504 are charged to the egress instead of the account: accounts sharing one egress share one counter, the backoff is seconds-scale (1s, doubling, capped at 15s, jittered) and any success clears it; the account breaker (30 minutes, doubling to 6h) is no longer tripped by a link hiccup. 500 and 401/403/429 keep their old paths. Off by default.',
+    '已启用：出口级瞬时失败退避': 'On: egress-level transient backoff',
+    '已关闭出口级瞬时失败退避': 'Egress-level transient backoff off',
+    '总剩余积分：全部账号（含停用）之和；「可用」只算启用且未触发限额护栏的账号': 'Total remaining credits: the sum over every account, disabled included; "available" counts only accounts that are enabled and not parked by a limit guard.',
+    '总计（全部历史）': 'Total (all time)',
+    '权重': 'Weight',
+    '权重 >1 的账号优先接单，多个高权重账号按权重比分流量；它们都接不了单时其他账号照常顶上。1 = 不干预，临期积分优先等自动规则照旧。': 'Accounts with weight >1 are dispatched first; several weighted accounts split traffic by weight, and when none of them can take requests the others serve as usual. 1 = no override, automatic rules such as expiring-credits-first apply as before.',
+    '备注': 'Note',
+    '+ 备注': '+ note',
+    '点击编辑备注': 'Click to edit the note',
+    '点击添加备注，比如「批量」/「自用」': 'Click to add a note, e.g. "batch" / "personal"',
     '最近将过期': 'Expiring soonest',
     '最近请求': 'Recent requests',
     '有': '',
@@ -1373,7 +1392,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '没有可导入的账号。': 'No accounts to import.',
     '没有启用的代理槽，请先在「设置 → 账号代理槽」添加并保存': 'No proxy slot is enabled; add and save one under Settings → Account proxy slots first',
     '注意：切换后的身分会被保存，重启后继续沿用，不会自动回到 WB。': 'Note: the switched identity is saved and kept after a restart; it does not go back to WB on its own.',
-    '注意：开启后网关会主动出网抓取模型给出的 URL（只挡字面私网地址），且每轮代跑都会多跑一次上游、多消耗该账号的额度；国内网络下 DuckDuckGo 可能连不上，那时模型拿到的是错误文本。': 'Note: with this on, the gateway goes out to fetch the URLs the model asks for (only literal private addresses are blocked), and every proxied round makes one extra upstream call and spends more of that account quota; on Chinese networks DuckDuckGo may be unreachable, and the model then gets error text.',
+    '注意：开启后网关会主动出网抓取模型给出的 URL（字面私网地址与解析进内网的域名都会被挡），且每轮代跑都会多跑一次上游、多消耗该账号的额度；某个搜寻引擎被限流时会自动轮换到下一家，全部不可用才把明确错误交给模型。': 'Note: with this on, the gateway goes out to fetch the URLs the model asks for (literal private addresses and hostnames resolving into a private network are both blocked), and every proxied round makes one extra upstream call and spends more of that account quota; when a search backend is rate-limited the gateway rotates to the next one automatically, and only hands the model a clear failure when every backend is unavailable.',
     '活跃打卡成功': 'Activity check-in succeeded',
     '流式': 'Streaming',
     '浅色': 'Light',
@@ -1653,7 +1672,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '选择颜色主题': 'Choose a color theme',
     '速度': 'Speed',
     '那一份（': '(that set,',
-    '部分客户端（如 Codex App）会宣告 web_search / web_fetch 这类服务端工具，而上游没有对应的执行器：声明送上去，模型看到工具却没有执行器，客户端最后只拿到一句 unsupported call。开启后由本网关代跑——把声明换成自己的同名函数，在本地执行（搜索走 DuckDuckGo，抓页面抓这个 URL）再把结果喂回模型。默认关闭，关闭时声明原样透传，客户端自己声明的搜索工具照常拿到调用。': 'Some clients (such as the Codex App) declare server-side tools like web_search / web_fetch, but the upstream has no executor for them: the declaration goes up, the model sees the tool with nothing to run it, and the client ends up with nothing but unsupported call. With this on, the gateway runs them instead: it swaps the declaration for its own same-named function, runs it locally (search through DuckDuckGo, page fetch for that URL) and feeds the result back to the model. Off by default; when off the declaration passes through untouched and search tools the client declares itself still get called.',
+    '部分客户端（如 Codex App）会宣告 web_search / web_fetch 这类服务端工具，而上游没有对应的执行器：声明送上去，模型看到工具却没有执行器，客户端最后只拿到一句 unsupported call。开启后由本网关代跑——把声明换成自己的同名函数，在本地执行（搜索按 DuckDuckGo → Bing → Wikipedia → Stack Overflow → Google News 的顺序自动轮换，抓页面抓这个 URL）再把结果喂回模型。默认关闭，关闭时声明原样透传，客户端自己声明的搜索工具照常拿到调用。': 'Some clients (such as the Codex App) declare server-side tools like web_search / web_fetch, but the upstream has no executor for them: the declaration goes up, the model sees the tool with nothing to run it, and the client ends up with nothing but unsupported call. With this on, the gateway runs them instead: it swaps the declaration for its own same-named function, runs it locally (search rotates automatically through DuckDuckGo -> Bing -> Wikipedia -> Stack Overflow -> Google News; page fetch uses that URL) and feeds the result back to the model. Off by default; when off the declaration passes through untouched and search tools the client declares itself still get called.',
     '重新扫描': 'Rescan',
     '重新生成链接': 'Regenerate link',
     '错误': 'errors',
@@ -1863,6 +1882,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "出站身份：": "出站身份：",
     "分配代理出口给未绑定账号": "分配代理出口給未繫結帳號",
     "一键分配代理": "一鍵分配代理",
+    "一键切换所有出站身份：": "一鍵切換所有出站身份：",
     "分钟": "分鐘",
     "分钟)": "分鐘)",
     "分钟取一次价": "分鐘取一次價",
@@ -1938,6 +1958,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "将覆盖同 UID 的现有账号（含其凭证），确定继续？": "將覆蓋同 UID 的現有帳號（含其憑證），確定繼續？",
     "将该账号的出站身份切换为": "將該帳號的出站身份切換為",
     "将该账号的出站身份切换为 ": "將該帳號的出站身份切換為 ",
+    "将把全部账号的出站身份切换为 ": "將把全部帳號的出站身份切換為 ",
+    "？（含另一个版本）": "？（含另一個版本）",
+    "把全部账号（含另一个版本）的出站身份切到下一个：WB → VSC → CLI": "把全部帳號（含另一個版本）的出站身份切到下一個：WB → VSC → CLI",
     "尚未选择文件。": "尚未選擇檔案。",
     "展开查看每个模型当前生效的策略": "展開檢視每個模型目前生效的策略",
     "展开逐条查看 / 手填 OpenRouter id": "展開逐條檢視 / 手填 OpenRouter id",
@@ -1949,6 +1972,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "已保存 ": "已儲存 ",
     "已保存积分数据刷新间隔": "已儲存積分資料重新整理間隔",
     "已全部停用所有账号": "已全部停用所有帳號",
+    "已把全部账号的出站身份切换为 ": "已把全部帳號的出站身份切換為 ",
     "已全部启用所有账号": "已全部啟用所有帳號",
     "已关闭变体继承：带后缀的名字不再自动取价": "已關閉變體繼承：帶字尾的名字不再自動取價",
     "已关闭：工具声明原样透传": "已關閉：工具宣告原樣透傳",
@@ -2064,6 +2088,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "每个账号固定绑定一个出口代理槽。槽位地址变化时绑定账号自动跟随；禁用或删除后回退直连。": "每個帳號固定繫結一個出口代理槽。槽位地址變化時繫結帳號自動跟隨；禁用或刪除後回退直連。",
     "每日签到 (国内版)": "每日簽到 (國內版)",
     "Buddy 加油站签到": "Buddy 加油站簽到",
+    "本期 Buddy 加油站活动": "本期 Buddy 加油站活動",
+    "当前连续登录天数": "目前連續登入天數",
+    "WorkBuddy 成长计划": "WorkBuddy 成長計劃",
     "每日签到:": "每日簽到:",
     "每日签到: ": "每日簽到: ",
     "每账号每日上限（token）": "每帳號每日上限（token）",
@@ -2072,7 +2099,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "没有可导入的账号。": "沒有可匯入的帳號。",
     "没有启用的代理槽，请先在「设置 → 代理槽」添加并保存": "沒有啟用的代理槽，請先在「設定 → 代理槽」新增並儲存",
     "注意：切换后的身分会被保存，重启后继续沿用，不会自动回到 WB。": "注意：切換後的身分會被儲存，重啟後繼續沿用，不會自動回到 WB。",
-    "注意：开启后网关会主动出网抓取模型给出的 URL（只挡字面私网地址），且每轮代跑都会多跑一次上游、多消耗该账号的额度；国内网络下 DuckDuckGo 可能连不上，那时模型拿到的是错误文本。": "注意：開啟後閘道會主動出網抓取模型給出的 URL（只擋字面私網地址），且每輪代跑都會多跑一次上游、多消耗該帳號的額度；國內網路下 DuckDuckGo 可能連不上，那時模型拿到的是錯誤文字。",
+    "注意：开启后网关会主动出网抓取模型给出的 URL（字面私网地址与解析进内网的域名都会被挡），且每轮代跑都会多跑一次上游、多消耗该账号的额度；某个搜寻引擎被限流时会自动轮换到下一家，全部不可用才把明确错误交给模型。": "注意：開啟後閘道會主動出網抓取模型給出的 URL（字面私網地址與解析進內網的網域都會被擋），且每輪代跑都會多跑一次上游、多消耗該帳號的額度；某個搜尋引擎被限流時會自動輪換到下一家，全部不可用才把明確錯誤交給模型。",
     "测试通过 (": "測試透過 (",
     "浏览器拒绝了复制操作": "瀏覽器拒絕了複製操作",
     "添加 WorkBuddy 账号 (OAuth 授权)": "新增 WorkBuddy 帳號 (OAuth 授權)",
@@ -2182,6 +2209,16 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "账号当日消费的积分达到该值后，只允许请求免费模型（目录中标记为 x0.00 的模型），需要花费积分的模型自动切到其他账号；本地时间 0 点后自动恢复。填 0 表示关闭（默认）。": "帳號當日消費的積分達到該值後，只允許請求免費模型（目錄中標記為 x0.00 的模型），需要花費積分的模型自動切到其他帳號；本地時間 0 點後自動恢復。填 0 表示關閉（預設）。",
     "账号「最早到期的积分包」（还有剩余、且到期会真正作废的那些）距今不超过该天数时，分派优先使用临期积分的账号——分到的流量更多、越接近到期份额越大，但不会全压在一个账号上（到期日相同或相近的账号彼此等权）；这些账号暂时都不可用（冷却、达日限额等）时，其他账号照常顶上。填 0 表示关闭；天数取自各账号最近一次刷新的积分数据。": "帳號「最早到期的積分包」（還有剩餘、且到期會真正作廢的那些）距今不超過該天數時，分派優先使用臨期積分的帳號——分到的流量更多、越接近到期份額越大，但不會全壓在一個帳號上（到期日相同或相近的帳號彼此等權）；這些帳號暫時都不可用（冷卻、達日限額等）時，其他帳號照常頂上。填 0 表示關閉；天數取自各帳號最近一次重新整理的積分資料。",
     "剩余用量优先调度": "剩餘用量優先排程",
+    "出口级瞬时失败退避": "出口級瞬時失敗退避",
+    "启用出口级退避": "啟用出口級退避",
+    "传输类失败与 502/503/504 改记在「出口」而不是账号上：同一个出口的账号共用一个计数器，退避是秒级（1 秒起、翻倍、封顶 15 秒、带抖动），任一次成功即清零；账号级熔断（30 分钟起、翻倍到 6 小时）不再被一次链路抖动触发。500 与 401/403/429 仍走原路径。默认关闭。": "傳輸類失敗與 502/503/504 改記在「出口」而不是帳號上：同一個出口的帳號共用一個計數器，退避是秒級（1 秒起、翻倍、封頂 15 秒、帶抖動），任一次成功即清零；帳號級熔斷（30 分鐘起、翻倍到 6 小時）不再被一次鏈路抖動觸發。500 與 401/403/429 仍走原路徑。預設關閉。",
+    "已启用：出口级瞬时失败退避": "已啟用：出口級瞬時失敗退避",
+    "已关闭出口级瞬时失败退避": "已關閉出口級瞬時失敗退避",
+    "总剩余积分：全部账号（含停用）之和；「可用」只算启用且未触发限额护栏的账号": "總剩餘積分：全部帳號（含停用）之和；「可用」只算啟用且未觸發限額護欄的帳號",
+    "总计（全部历史）": "總計（全部歷史）",
+    "权重 >1 的账号优先接单，多个高权重账号按权重比分流量；它们都接不了单时其他账号照常顶上。1 = 不干预，临期积分优先等自动规则照旧。": "權重 >1 的帳號優先接單，多個高權重帳號按權重比分流量；它們都接不了單時其他帳號照常頂上。1 = 不干預，臨期積分優先等自動規則照舊。",
+    "点击编辑备注": "點擊編輯備註",
+    "点击添加备注，比如「批量」/「自用」": "點擊新增備註，例如「批量」/「自用」",
     "按「剩余用量估算」优先调度：某 (账号 × 模型) 的估计剩余越接近耗尽，分到的请求越多——先把快用完的额度用掉，等它到点重置。剩余不到 30% 开始加权、5% 以内权重最高；没有预算样本、或剩余为 0 / 冷却中的组合不参与。默认关闭。": "按「剩餘用量估算」優先排程：某 (帳號 × 模型) 的估計剩餘越接近耗盡，分到的請求越多——先把快用完的額度用掉，等它到點重置。剩餘不到 30% 開始加權、5% 以內權重最高；沒有預算樣本、或剩餘為 0 / 冷卻中的組合不參與。預設關閉。",
     "注意：估算由撞线样本反推的预算与本地用量得出，本身有误差；开启后接近耗尽的账号会明显多接流量，也可能更早撞到上游限额（撞线后该模型停用到上游给出的恢复时刻）。": "注意：估算由撞線樣本反推的預算與本地用量得出，本身有誤差；開啟後接近耗盡的帳號會明顯多接流量，也可能更早撞到上游限額（撞線後該模型停用到上游給出的恢復時刻）。",
     "启用优先调度": "啟用優先排程",
@@ -2208,7 +2245,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象， 以及桌面客户端的": "選擇一個帳號 JSON 檔案。支援本閘道匯出的檔案、帳號陣列、單個帳號物件， 以及桌面客戶端的",
     "选择要登录的版本：": "選擇要登入的版本：",
     "逐个刷新所有账号的上游访问凭证（相当于对每个账号点一次「刷新凭证」）": "逐個重新整理所有帳號的上游訪問憑證（相當於對每個帳號點一次「重新整理憑證」）",
-    "部分客户端（如 Codex App）会宣告 web_search / web_fetch 这类服务端工具，而上游没有对应的执行器：声明送上去，模型看到工具却没有执行器，客户端最后只拿到一句 unsupported call。开启后由本网关代跑——把声明换成自己的同名函数，在本地执行（搜索走 DuckDuckGo，抓页面抓这个 URL）再把结果喂回模型。默认关闭，关闭时声明原样透传，客户端自己声明的搜索工具照常拿到调用。": "部分客戶端（如 Codex App）會宣告 web_search / web_fetch 這類服務端工具，而上游沒有對應的執行器：宣告送上去，模型看到工具卻沒有執行器，客戶端最後只拿到一句 unsupported call。開啟後由本閘道代跑——把宣告換成自己的同名函式，在本地執行（搜尋走 DuckDuckGo，抓頁面抓這個 URL）再把結果喂回模型。預設關閉，關閉時宣告原樣透傳，客戶端自己宣告的搜尋工具照常拿到呼叫。",
+    "部分客户端（如 Codex App）会宣告 web_search / web_fetch 这类服务端工具，而上游没有对应的执行器：声明送上去，模型看到工具却没有执行器，客户端最后只拿到一句 unsupported call。开启后由本网关代跑——把声明换成自己的同名函数，在本地执行（搜索按 DuckDuckGo → Bing → Wikipedia → Stack Overflow → Google News 的顺序自动轮换，抓页面抓这个 URL）再把结果喂回模型。默认关闭，关闭时声明原样透传，客户端自己声明的搜索工具照常拿到调用。": "部分客戶端（如 Codex App）會宣告 web_search / web_fetch 這類服務端工具，而上游沒有對應的執行器：宣告送上去，模型看到工具卻沒有執行器，客戶端最後只拿到一句 unsupported call。開啟後由本閘道代跑——把宣告換成自己的同名函式，在本地執行（搜尋按 DuckDuckGo → Bing → Wikipedia → Stack Overflow → Google News 的順序自動輪換，抓頁面抓這個 URL）再把結果喂回模型。預設關閉，關閉時宣告原樣透傳，客戶端自己宣告的搜尋工具照常拿到呼叫。",
     "重新打开会补算关闭期间的请求": "重新開啟會補算關閉期間的請求",
     "重新生成链接": "重新生成連結",
     "限额已保存": "限額已儲存",
@@ -2852,8 +2889,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div class="mono" style="font-size:11px;color:var(--dim);margin-bottom:8px">www.workbuddy.ai</div>
       <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:8px">
         <div style="display:flex;align-items:baseline;gap:6px">
-          <span id="tabIntlCredits" style="font-size:22px;font-weight:700;color:var(--accent2);letter-spacing:-.5px">0</span>
-          <span style="font-size:12px;color:var(--dim)">剩余积分 · <span id="tabIntlAccts" style="color:var(--fg);font-weight:600">0/0 可用</span></span>
+          <span id="tabIntlCredits" style="font-size:22px;font-weight:700;color:var(--accent2);letter-spacing:-.5px" title="总剩余积分：全部账号（含停用）之和；「可用」只算启用且未触发限额护栏的账号">0</span>
+          <span style="font-size:12px;color:var(--dim)">剩余积分 · <span id="tabIntlAvailCred" style="color:var(--fg);font-weight:600">可用 —</span> · <span id="tabIntlAccts" style="color:var(--fg);font-weight:600">0/0 账号</span></span>
         </div>
         <span id="tabIntlKeyBadge" class="badge s mini" style="font-weight:600">0 个 Key</span>
       </div>
@@ -2871,8 +2908,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div class="mono" style="font-size:11px;color:var(--dim);margin-bottom:8px">copilot.tencent.com</div>
       <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:8px">
         <div style="display:flex;align-items:baseline;gap:6px">
-          <span id="tabCnCredits" style="font-size:22px;font-weight:700;color:var(--accent2);letter-spacing:-.5px">0</span>
-          <span style="font-size:12px;color:var(--dim)">剩余积分 · <span id="tabCnAccts" style="color:var(--fg);font-weight:600">0/0 可用</span></span>
+          <span id="tabCnCredits" style="font-size:22px;font-weight:700;color:var(--accent2);letter-spacing:-.5px" title="总剩余积分：全部账号（含停用）之和；「可用」只算启用且未触发限额护栏的账号">0</span>
+          <span style="font-size:12px;color:var(--dim)">剩余积分 · <span id="tabCnAvailCred" style="color:var(--fg);font-weight:600">可用 —</span> · <span id="tabCnAccts" style="color:var(--fg);font-weight:600">0/0 账号</span></span>
         </div>
         <span id="tabCnKeyBadge" class="badge warn mini" style="font-weight:600">0 个 Key</span>
       </div>
@@ -3008,6 +3045,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <button class="sec" id="btnDailyChatWeb" onclick="doDailyChatWeb(this)" style="display:none">网页通道打卡 (国际版)</button>
     <span class="toolbar-sep" aria-hidden="true"></span>
     <button class="sec" onclick="autoAssignSlots()" title="把尚未绑定出口的已启用账号依次分配到已启用的代理槽；已有绑定的账号不受影响">一键分配代理</button>
+    <button class="sec" id="btnProductAll" onclick="cycleAllProducts(this)" title="把全部账号（含另一个版本）的出站身份切到下一个：WB → VSC → CLI">一键切换所有出站身份：<span id="productAllLabel">WB</span></button>
     <button class="sec" onclick="setAll(true, this)">全部启用</button>
     <button class="sec" onclick="setAll(false, this)">全部停用</button>
     
@@ -3109,13 +3147,15 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </div>
 
     <div class="cards" style="margin-bottom:16px;grid-template-columns:repeat(auto-fit,minmax(185px,1fr))">
-      <div class="card accent2">
-        <div class="k">Buddy 加油站签到</div>
+      <div class="card accent2" title="活动 Season: 10 (第 10 期)&#10;活动开始时间: 2026-09-30 00:00:00&#10;活动截止时间: 2026-10-15 23:59:59">
+        <div class="k">本期 Buddy 加油站活动</div>
         <div class="v" id="cnTodayCheckinState" style="font-size:17px;letter-spacing:-.2px">-</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:4px">第 10 期 (至 10-15 23:59 止)</div>
       </div>
-      <div class="card">
-        <div class="k">连续打卡天数</div>
+      <div class="card" title="WorkBuddy 成长计划连续登录活跃天数；达到 7/14/28 天可兑换连登奖励">
+        <div class="k">当前连续登录天数</div>
         <div class="v" id="stkDays" style="color:var(--accent2)">-</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:4px">WorkBuddy 成长计划</div>
       </div>
       <div class="card">
         <div class="k">补签卡余额</div>
@@ -3212,7 +3252,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div class="card">
         <div class="k">上下文缓存命中率</div>
         <div class="v" id="kpiCacheRate">0.0%</div>
-        <div class="s">提示词前缀命中复用比</div>
+        <div class="s" id="kpiCacheDetail">提示词前缀命中复用比</div>
       </div>
       <div class="card">
         <div class="k" id="kpiReqTitle">今日请求数</div>
@@ -3717,10 +3757,10 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
           <div>
             <h2 style="margin:0">本地网络工具 <em id="setLocalWebToolsState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
-              部分客户端（如 Codex App）会宣告 web_search / web_fetch 这类服务端工具，而上游没有对应的执行器：声明送上去，模型看到工具却没有执行器，客户端最后只拿到一句 unsupported call。开启后由本网关代跑——把声明换成自己的同名函数，在本地执行（搜索走 DuckDuckGo，抓页面抓这个 URL）再把结果喂回模型。默认关闭，关闭时声明原样透传，客户端自己声明的搜索工具照常拿到调用。
+              部分客户端（如 Codex App）会宣告 web_search / web_fetch 这类服务端工具，而上游没有对应的执行器：声明送上去，模型看到工具却没有执行器，客户端最后只拿到一句 unsupported call。开启后由本网关代跑——把声明换成自己的同名函数，在本地执行（搜索按 DuckDuckGo → Bing → Wikipedia → Stack Overflow → Google News 的顺序自动轮换，抓页面抓这个 URL）再把结果喂回模型。默认关闭，关闭时声明原样透传，客户端自己声明的搜索工具照常拿到调用。
             </div>
             <div style="font-size:12px;color:var(--warn);margin-top:4px">
-              注意：开启后网关会主动出网抓取模型给出的 URL（只挡字面私网地址），且每轮代跑都会多跑一次上游、多消耗该账号的额度；国内网络下 DuckDuckGo 可能连不上，那时模型拿到的是错误文本。
+              注意：开启后网关会主动出网抓取模型给出的 URL（字面私网地址与解析进内网的域名都会被挡），且每轮代跑都会多跑一次上游、多消耗该账号的额度；某个搜寻引擎被限流时会自动轮换到下一家，全部不可用才把明确错误交给模型。
             </div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
@@ -3755,7 +3795,27 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       </section>
 
       <section>
-<h2 style="margin:0">更新 <em id="setUpdateState"></em></h2>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">出口级瞬时失败退避 <em id="setEgressBackoffState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              传输类失败与 502/503/504 改记在「出口」而不是账号上：同一个出口的账号共用一个计数器，退避是秒级（1 秒起、翻倍、封顶 15 秒、带抖动），任一次成功即清零；账号级熔断（30 分钟起、翻倍到 6 小时）不再被一次链路抖动触发。500 与 401/403/429 仍走原路径。默认关闭。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setEgressBackoff" type="checkbox" style="width:16px;height:16px">
+              启用出口级退避
+            </label>
+            <button onclick="saveEgressBackoff(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">更新 <em id="setUpdateState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
               网关匿名查询 GitHub 的公开 Release 列表，与当前运行的版本比较。本版只检查：不下载、不安装、不重启，账号与用量数据不会被碰。
             </div>
@@ -4283,6 +4343,10 @@ function updateUI(){
     if(el) el.textContent = sectionRealm;
   });
 
+  // 工具栏上「一键切换所有出站身份」的当前值：它作用于全部账号（含另一个
+  // 版本），所以不看视图、只看 window.ACCOUNTS。
+  updateProductAllButton();
+
   const isIntlGw = (window.ACTIVE_GATEWAY_REALM === "intl");
   const dbIntl = document.getElementById("tabIntlDefaultBadge");
   if(dbIntl) dbIntl.style.display = isIntlGw ? "inline-block" : "none";
@@ -4331,29 +4395,46 @@ function updateUI(){
   const elCnKey = document.getElementById("tabCnKeyBadge");
   if(elCnKey) elCnKey.textContent = cnKeys + ' 个 Key';
 
-  // 左侧卡片账号数与积分统计
+  // 左侧卡片账号数与积分统计：大数字是「总剩余」（含停用账号），副行的
+  // 「可用」只算 isAcctActive（启用且未触发保留/限额护栏）的账号——与旁边
+  // 的 N/M 账号计数同一个口径，两个数字才有可比性。
   const allAccts = window.ACCOUNTS || [];
   const intlAccts = allAccts.filter(a => a.realm === 'intl' || !a.realm);
   const cnAccts = allAccts.filter(a => a.realm === 'cn');
 
-  let intlCred = 0, hasIntlCred = false;
-  intlAccts.forEach(a => { if(a.credits && a.credits.remain != null){ intlCred += a.credits.remain; hasIntlCred = true; } });
-  let cnCred = 0, hasCnCred = false;
-  cnAccts.forEach(a => { if(a.credits && a.credits.remain != null){ cnCred += a.credits.remain; hasCnCred = true; } });
-
   const isAcctActive = a => a.enabled && !a.reserveBlocked && !a.dailyLimitBlocked && !a.creditLimitReached;
+
+  let intlCred = 0, hasIntlCred = false, intlAvailCred = 0, hasIntlAvail = false;
+  intlAccts.forEach(a => {
+    if(a.credits && a.credits.remain != null){
+      intlCred += a.credits.remain; hasIntlCred = true;
+      if(isAcctActive(a)){ intlAvailCred += a.credits.remain; hasIntlAvail = true; }
+    }
+  });
+  let cnCred = 0, hasCnCred = false, cnAvailCred = 0, hasCnAvail = false;
+  cnAccts.forEach(a => {
+    if(a.credits && a.credits.remain != null){
+      cnCred += a.credits.remain; hasCnCred = true;
+      if(isAcctActive(a)){ cnAvailCred += a.credits.remain; hasCnAvail = true; }
+    }
+  });
+
   const intlActive = intlAccts.filter(isAcctActive).length;
   const cnActive = cnAccts.filter(isAcctActive).length;
 
   const elIntlCred = document.getElementById("tabIntlCredits");
   if(elIntlCred) elIntlCred.textContent = hasIntlCred ? fmt(intlCred) : "—";
+  const elIntlAvail = document.getElementById("tabIntlAvailCred");
+  if(elIntlAvail) elIntlAvail.innerHTML = '可用 <b style="color:var(--accent2)">' + (hasIntlAvail ? fmt(intlAvailCred) : "—") + '</b>';
   const elIntlAcct = document.getElementById("tabIntlAccts");
-  if(elIntlAcct) elIntlAcct.innerHTML = '<b style="color:var(--accent)">' + intlActive + '</b>/' + intlAccts.length + ' 可用';
+  if(elIntlAcct) elIntlAcct.innerHTML = '<b style="color:var(--accent)">' + intlActive + '</b>/' + intlAccts.length + ' 账号';
 
   const elCnCred = document.getElementById("tabCnCredits");
   if(elCnCred) elCnCred.textContent = hasCnCred ? fmt(cnCred) : "—";
+  const elCnAvail = document.getElementById("tabCnAvailCred");
+  if(elCnAvail) elCnAvail.innerHTML = '可用 <b style="color:var(--accent2)">' + (hasCnAvail ? fmt(cnAvailCred) : "—") + '</b>';
   const elCnAcct = document.getElementById("tabCnAccts");
-  if(elCnAcct) elCnAcct.innerHTML = '<b style="color:var(--accent)">' + cnActive + '</b>/' + cnAccts.length + ' 可用';
+  if(elCnAcct) elCnAcct.innerHTML = '<b style="color:var(--accent)">' + cnActive + '</b>/' + cnAccts.length + ' 账号';
 };
 
 // 切换视图的唯一入口：改完 VIEW_REALM 立刻用**已经加载好的**全量 window.ACCOUNTS
@@ -4560,22 +4641,7 @@ async function loadIntlTasks(){
       intlTotalEl.textContent = '+' + fmt(totalAmt) + ' 积分';
     }
 
-    const stateEl = document.getElementById("intlTodayActiveState");
-    if(stateEl){
-      if(!accts.length){
-        stateEl.textContent = '无国际账号';
-      } else {
-        const today = new Date().toISOString().slice(0, 10);
-        const doneCount = accts.filter(a => a.lastDailyChat && a.lastDailyChat.startsWith(today)).length;
-        if(doneCount === accts.length){
-          stateEl.innerHTML = '<span style="color:#26bb82">今日已打卡 (' + doneCount + '/' + accts.length + ')</span>';
-        } else if(doneCount > 0){
-          stateEl.innerHTML = '<span style="color:var(--accent)">部分已打卡 (' + doneCount + '/' + accts.length + ')</span>';
-        } else {
-          stateEl.innerHTML = '<span style="color:var(--warn)">今日未打卡 (0/' + accts.length + ')</span>';
-        }
-      }
-    }
+    if(typeof updateTaskPageCheckinCards === 'function') updateTaskPageCheckinCards();
   }catch(e){
     console.error('loadIntlTasks error:', e);
   }
@@ -4604,32 +4670,7 @@ async function loadGrowthTasks(){
       sel.innerHTML = opts;
     }
 
-    const chkStateEl = document.getElementById("cnTodayCheckinState");
-    if(chkStateEl){
-      try{
-        const allAcctsRes = await getJSON('/accounts?realm=all');
-        const allList = allAcctsRes.accounts || [];
-        let targetAccts = allList.filter(a => a.realm === 'cn' && a.enabled);
-        if(CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all'){
-          targetAccts = targetAccts.filter(a => a.uid === CURRENT_GROWTH_UID);
-        }
-        if(!targetAccts.length){
-          chkStateEl.textContent = '无国内账号';
-        } else {
-          const today = new Date().toISOString().slice(0, 10);
-          const doneCount = targetAccts.filter(a => a.lastCheckin && a.lastCheckin.startsWith(today)).length;
-          if(doneCount === targetAccts.length){
-            chkStateEl.innerHTML = '<span style="color:#26bb82">今日已签到 (' + doneCount + '/' + targetAccts.length + ')</span>';
-          } else if(doneCount > 0){
-            chkStateEl.innerHTML = '<span style="color:var(--accent)">部分已签到 (' + doneCount + '/' + targetAccts.length + ')</span>';
-          } else {
-            chkStateEl.innerHTML = '<span style="color:var(--warn)">今日未签到 (0/' + targetAccts.length + ')</span>';
-          }
-        }
-      }catch(e){
-        chkStateEl.textContent = '-';
-      }
-    }
+    if(typeof updateTaskPageCheckinCards === 'function') updateTaskPageCheckinCards();
 
     const elStk = document.getElementById("stkDays");
     if(elStk) elStk.textContent = streak + ' 天';
@@ -4905,6 +4946,23 @@ async function doDailyChatWeb(btn){
 }
 
 const fmt = n => (n ?? 0).toLocaleString('en-US');
+/* Token 数的紧凑显示：<1 万精确显示（千分位），≥1 万 K，≥100 万 M，≥10 亿 B；
+   小数位随量级收缩（123K / 12.3K / 1.23K），尾零去掉。单位用大写 K/M/B，
+   与表头排序解析器（cellSortValue 的 'K'/'M'/'G' 换算）同一口径，带单位的
+   单元格照样按数值排序。 */
+const fmtCompact = n => {
+  const v = Number(n) || 0;
+  const abs = Math.abs(v);
+  const pick = (div, suffix) => {
+    const x = v / div;
+    const d = Math.abs(x) >= 100 ? 0 : Math.abs(x) >= 10 ? 1 : 2;
+    return x.toFixed(d).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '') + suffix;
+  };
+  if(abs >= 1e9) return pick(1e9, 'B');
+  if(abs >= 1e6) return pick(1e6, 'M');
+  if(abs >= 1e4) return pick(1e3, 'K');
+  return fmt(v);
+};
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const ms = v => v == null ? '—' : (v >= 1000 ? (v/1000).toFixed(2) + ' s' : Math.round(v) + ' ms');
 const pct = v => v == null ? '—' : v.toFixed(1) + '%';
@@ -5060,6 +5118,7 @@ function cellSortValue(cell, kind){
     case 'K': return n * 1e3;
     case 'M': return n * 1e6;
     case 'G': return n * 1e9;
+    case 'B': return n * 1e9;   // fmtCompact 用 B 表示十亿，别让那一格按 1.5 排序
     default: return n;           // ms / % / 空 / 其它后缀（tok/s 之类）一律原值
   }
 }
@@ -5669,41 +5728,95 @@ function todayStamp(){
   return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
 }
 
-// 一个账号今天的活动状态。label 按区域取（国内版叫签到，国际版叫活跃），
-// state 是四种互斥的结局之一。
+// 一个账号今天的活动状态。
+// 国际版只有一项：今日活跃（daily_chat 流水或 lastDailyChat）。
+// 国内版有两项独立活动：
+//   1. Buddy 加油站（checkin 流水或 lastCheckin）
+//   2. 成长计划签到（连登活跃上报 lastActivityReport）
 function activityStatusOf(a){
   const uid = String((a && a.uid) || '');
   const isCn = (a && a.realm) === 'cn';
-  const label = isCn ? '今日签到' : '今日活跃';
-  const done = isCn ? (a && a.lastCheckin) : (a && a.lastDailyChat);
+  if(!isCn){
+    const label = '今日活跃';
+    const done = a && a.lastDailyChat;
+    const event = ACTIVITY_TODAY.byUid[uid];
+    if(event){
+      return {kind: event.ok ? 'ok' : 'failed', label: label,
+              state: event.ok ? '成功' : '失败',
+              at: String(event.ts || '').replace('T', ' ').slice(0, 19),
+              message: String(event.message || '')};
+    }
+    if(done && String(done).startsWith(todayStamp())){
+      return {kind: 'done', label: label, state: '已完成', at: '', message: ''};
+    }
+    return {kind: 'none', label: label, state: '无记录', at: '', message: ''};
+  }
+
+  // 国内版：加油站
   const event = ACTIVITY_TODAY.byUid[uid];
-  if(event){
-    return {kind: event.ok ? 'ok' : 'failed', label: label,
-            state: event.ok ? '成功' : '失败',
-            at: String(event.ts || '').replace('T', ' ').slice(0, 19),
-            message: String(event.message || '')};
+  const gasDone = a && a.lastCheckin;
+  let gas = {kind: 'none', label: '加油站', state: '未领', at: '', message: ''};
+  if(event && event.task === 'checkin'){
+    gas = {kind: event.ok ? 'ok' : 'failed', label: '加油站',
+           state: event.ok ? '已领' : '失败',
+           at: String(event.ts || '').replace('T', ' ').slice(0, 19),
+           message: String(event.message || '')};
+  } else if(gasDone && String(gasDone).startsWith(todayStamp())){
+    gas = {kind: 'done', label: '加油站', state: '已领', at: '', message: ''};
   }
-  if(done && String(done).startsWith(todayStamp())){
-    return {kind: 'done', label: label, state: '已完成', at: '', message: ''};
+
+  // 国内版：成长计划连登打卡
+  const streakDone = a && a.lastActivityReport;
+  let streak = {kind: 'none', label: '成长连登', state: '未打卡', at: '', message: ''};
+  if(streakDone && String(streakDone).startsWith(todayStamp())){
+    streak = {kind: 'done', label: '成长连登', state: '已打卡', at: String(streakDone), message: '连登活跃已上报'};
   }
-  return {kind: 'none', label: label, state: '无记录', at: '', message: ''};
+
+  return {isCn: true, gas: gas, streak: streak,
+          // 整体是否算已完成（供任务页统计卡片判断）
+          kind: (gas.kind === 'ok' || gas.kind === 'done') ? 'done' : 'none'};
 }
 
 function activityStatusChip(a){
   const status = activityStatusOf(a);
-  // uid 来自上游 JWT：内联到属性里之前先按安全字符集收紧，和账号行其它按钮一致。
   const uidAttr = esc(String((a && a.uid) || '').replace(/[^\w.@-]/g, ''));
-  const cls = status.kind === 'ok' ? 'badge ok'
-            : status.kind === 'failed' ? 'badge bad'
-            : status.kind === 'done' ? 'badge' : 'badge off';
-  const tip = status.kind === 'none'
-    ? status.label + '：今天还没有记录（没有记录不等于失败）'
-    : (status.label + '：' + status.state
-       + (status.at ? ' · ' + status.at : '')
-       + (status.message ? ' · ' + status.message : ''));
-  return '<span class="' + cls + '" style="cursor:pointer" title="' + esc(tip) + '"'
+  if(!status.isCn){
+    const cls = status.kind === 'ok' ? 'badge ok'
+              : status.kind === 'failed' ? 'badge bad'
+              : status.kind === 'done' ? 'badge ok' : 'badge off';
+    const tip = status.kind === 'none'
+      ? status.label + '：今天还没有记录（没有记录不等于失败）'
+      : (status.label + '：' + status.state
+         + (status.at ? ' · ' + status.at : '')
+         + (status.message ? ' · ' + status.message : ''));
+    return '<span class="' + cls + '" style="cursor:pointer" title="' + esc(tip) + '"'
+      + ' onclick="openActivityHistory(&quot;' + uidAttr + '&quot;)">'
+      + esc(status.label + ' · ' + status.state) + '</span>';
+  }
+
+  // 国内版双徽章渲染：主徽章保持「今日签到 · 成功/失败/已完成/无记录」，保证历史兼容；副徽章标明「成长计划」连登状态
+  const mainStatus = (status.gas.kind === 'ok') ? {cls: 'badge ok', text: '今日签到 · 成功', tip: status.gas.message}
+                   : (status.gas.kind === 'failed') ? {cls: 'badge bad', text: '今日签到 · 失败', tip: status.gas.message}
+                   : (status.gas.kind === 'done') ? {cls: 'badge ok', text: '今日签到 · 已完成', tip: ''}
+                   : {cls: 'badge off', text: '今日签到 · 无记录', tip: '今天还没有记录'};
+
+  const gasTip = 'Buddy加油站领取：' + (status.gas.state === '已领' ? '今日已领' : status.gas.state)
+               + (status.gas.at ? ' · ' + status.gas.at : '')
+               + (mainStatus.tip ? ' · ' + mainStatus.tip : '');
+
+  const stkCls = (status.streak.kind === 'done') ? 'badge ok' : 'badge off';
+  const stkTip = '成长计划连登活跃：' + status.streak.state
+               + (status.streak.at ? ' · ' + status.streak.at : '');
+
+  return '<div style="display:inline-flex;flex-direction:column;gap:4px;align-items:center">'
+    + '<span class="' + mainStatus.cls + '" style="cursor:pointer;white-space:nowrap" title="' + esc(gasTip) + '"'
     + ' onclick="openActivityHistory(&quot;' + uidAttr + '&quot;)">'
-    + esc(status.label + ' · ' + status.state) + '</span>';
+    + esc('Buddy 加油站 · ' + (status.gas.kind === 'none' ? '未领' : status.gas.state)) + '</span>'
+    + '<span class="' + stkCls + '" style="cursor:pointer;white-space:nowrap" title="' + esc(stkTip) + '"'
+    + ' onclick="openActivityHistory(&quot;' + uidAttr + '&quot;)">'
+    + esc('成长计划 · ' + (status.streak.kind === 'done' ? '已签到' : '未签到')) + '</span>'
+    + '</div>'
+    + '<span style="display:none">' + esc(mainStatus.text) + '</span>';
 }
 
 // 今天的事件，按 uid 建表。rows 是最新在前，所以第一次见到的就是最近一次。
@@ -5722,6 +5835,57 @@ async function loadActivityToday(){
     ACTIVITY_TODAY = {byUid: {}, error: (e && e.message) || '读取失败', loaded: true};
   }
 }
+
+// 任务与福利页面的今日打卡/签到卡片状态：与网关与账号页面的今日活跃/今日签到完全同一口径
+// 统一通过 activityStatusOf(a) 判定（以今天真实流水为准，回落到本日本地时间前缀）。
+function updateTaskPageCheckinCards(){
+  const allList = window.ACCOUNTS || [];
+  const stateEl = document.getElementById("intlTodayActiveState");
+  if(stateEl){
+    const intlAccts = allList.filter(a => a.realm === 'intl' && a.enabled);
+    if(!intlAccts.length){
+      stateEl.textContent = '无国际账号';
+    } else {
+      const isDone = a => {
+        const s = activityStatusOf(a);
+        return s.kind === 'ok' || s.kind === 'done';
+      };
+      const doneCount = intlAccts.filter(isDone).length;
+      if(doneCount === intlAccts.length){
+        stateEl.innerHTML = '<span style="color:#26bb82">今日已打卡 (' + doneCount + '/' + intlAccts.length + ')</span>';
+      } else if(doneCount > 0){
+        stateEl.innerHTML = '<span style="color:var(--accent)">部分已打卡 (' + doneCount + '/' + intlAccts.length + ')</span>';
+      } else {
+        stateEl.innerHTML = '<span style="color:var(--warn)">今日未打卡 (0/' + intlAccts.length + ')</span>';
+      }
+    }
+  }
+
+  const chkStateEl = document.getElementById("cnTodayCheckinState");
+  if(chkStateEl){
+    let targetAccts = allList.filter(a => a.realm === 'cn' && a.enabled);
+    if(typeof CURRENT_GROWTH_UID !== 'undefined' && CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all'){
+      targetAccts = targetAccts.filter(a => a.uid === CURRENT_GROWTH_UID);
+    }
+    if(!targetAccts.length){
+      chkStateEl.textContent = '无国内账号';
+    } else {
+      const isDone = a => {
+        const s = activityStatusOf(a);
+        return s.kind === 'ok' || s.kind === 'done';
+      };
+      const doneCount = targetAccts.filter(isDone).length;
+      if(doneCount === targetAccts.length){
+        chkStateEl.innerHTML = '<span style="color:#26bb82">今日已领 (' + doneCount + '/' + targetAccts.length + ')</span>';
+      } else if(doneCount > 0){
+        chkStateEl.innerHTML = '<span style="color:var(--accent)">部分已领 (' + doneCount + '/' + targetAccts.length + ')</span>';
+      } else {
+        chkStateEl.innerHTML = '<span style="color:var(--warn)">今日未领 (0/' + targetAccts.length + ')</span>';
+      }
+    }
+  }
+}
+
 
 // 面板拼查询串，筛选在服务端做；写错的取值服务端会回 400，这里原样透出。
 function activityFilterQuery(){
@@ -5825,6 +5989,9 @@ function closeActivityHistory(){
   if(mask) mask.style.display = 'none';
 }
 
+// 账号的手动调度权重提示：与 wb_accounts._pick_weighted_first 的行为一一对应。
+const WEIGHT_TIP = '权重 >1 的账号优先接单，多个高权重账号按权重比分流量；它们都接不了单时其他账号照常顶上。已开始的会话保持粘性不换号，权重对新会话生效。1 = 不干预，临期积分优先等自动规则照旧。';
+
 function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
@@ -5876,16 +6043,29 @@ function accountRow(a){
        + '<span style="color:var(--dim)">未查询</span>'
        + '<span class="badge mini" style="font-size:10px;padding:1px 5px;cursor:pointer" onclick="openCreditsDetail(&quot;' + uidAttr + '&quot;)" title="点击查询积分明细">查询</span>'
        + '</div>');
+  // 权重下拉：选项给 1-10；历史值超出范围时不让 select 悄悄跳回最近的档位，
+  // 补一个选中项把真实值显示出来。
+  const weight = Math.max(1, Math.min(100, Number(a.weight || 1) || 1));
+  let weightOpts = '';
+  for(let i = 1; i <= 10; i++){
+    weightOpts += '<option value="' + i + '"' + (weight === i ? ' selected' : '') + '>' + i + '</option>';
+  }
+  if(weight > 10) weightOpts += '<option value="' + weight + '" selected>' + weight + '</option>';
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap" data-label="版本">' + realmBadge + '</td>'
     + '<td style="text-align:left" data-label="账号">'
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
+    + (a.note
+        ? '<div style="font-size:11px;color:var(--accent2);margin-top:2px;cursor:pointer" title="点击编辑备注" onclick="editAccountNote(&quot;' + uidAttr + '&quot;)">备注: ' + esc(a.note) + '</div>'
+        : '<div style="font-size:10px;color:var(--dim);margin-top:2px;cursor:pointer;opacity:.7" title="点击添加备注，比如「批量」/「自用」" onclick="editAccountNote(&quot;' + uidAttr + '&quot;)">+ 备注</div>')
     + err + pills + limitPills + '</td>'
     + '<td style="text-align:center" data-label="状态">' + state + '</td>'
     + '<td style="text-align:center" data-label="今日活动">' + activityStatusChip(a) + '</td>'
     + '<td style="text-align:center" data-label="出口">' + slotSelectHtml(a) + '</td>'
+    + '<td style="text-align:center;white-space:nowrap" data-label="权重">'
+    +   '<select style="font-size:11px;padding:2px 4px" title="' + esc(WEIGHT_TIP) + '" onchange="setAccountWeight(&quot;' + uidAttr + '&quot;, this.value, this)">' + weightOpts + '</select></td>'
     + '<td style="text-align:left;white-space:nowrap" data-label="积分">' + credText + '</td>'
     + '<td style="text-align:right" data-label="请求">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right" data-label="总 token">' + fmt(usage.total_tokens) + '</td>'
@@ -6207,13 +6387,22 @@ async function loadActivityBoard(showToast, more){
 function renderAccounts(){
   // Same data source as the account cards, so the two views can never disagree.
   renderDisabled();
+  if(typeof updateTaskPageCheckinCards === 'function') updateTaskPageCheckinCards();
   const box = document.getElementById('accounts');
   const currentView = (window.VIEW_REALM || "intl");
   let list = accountsInView();
-  // Enabled accounts first; disabled ones sink to the bottom. Within each
-  // group keep the server order stable so the table does not jump around.
+  // 排序：停用的永远沉底（备注/权重再高也一样）→ 备注是启用组内的加分项
+  // （有备注的账号只在同权重时排前面，不再全局置顶）→ 权重高的在前 →
+  // 同权重保持服务端顺序稳定，表格不乱跳。
   list = list.map((a, i) => [a, i])
-    .sort((x, y) => (x[0].enabled === y[0].enabled) ? (x[1] - y[1]) : (x[0].enabled ? -1 : 1))
+    .sort((x, y) => {
+      if(x[0].enabled !== y[0].enabled) return x[0].enabled ? -1 : 1;
+      const nx = x[0].note ? 0 : 1, ny = y[0].note ? 0 : 1;
+      if(nx !== ny) return nx - ny;
+      const wx = Number(x[0].weight || 1) || 1, wy = Number(y[0].weight || 1) || 1;
+      if(wx !== wy) return wy - wx;
+      return x[1] - y[1];
+    })
     .map(pair => pair[0]);
   const usable = list.filter(a => a.enabled).length;
   const viewName = currentView === 'cn' ? '国内版' : '国际版';
@@ -6238,6 +6427,7 @@ function renderAccounts(){
     + '<th style="text-align:center;width:84px">状态</th>'
     + '<th style="text-align:center;width:118px">今日活动</th>'
     + '<th style="text-align:center;width:150px">出口</th>'
+    + '<th style="text-align:center;width:64px">权重</th>'
     + '<th style="text-align:left;width:120px">积分</th>'
     + '<th style="text-align:right;width:70px">请求</th>'
     + '<th style="text-align:right;width:88px">总 token</th>'
@@ -6305,6 +6495,31 @@ async function toggleAccount(uid, enable, btn){
     if(btn) btn.disabled = false;
   }
 }
+async function setAccountWeight(uid, weight, sel){
+  if(sel) sel.disabled = true;
+  try{
+    await postJSON('/accounts/set', {uid: uid, weight: Number(weight)});
+    await loadAccounts();
+    toast(Number(weight) > 1 ? '权重已调整：该账号将优先接单' : '权重已恢复默认', 'ok');
+  }catch(e){
+    toast('权重设置失败: ' + e.message, 'bad');
+    renderAccounts();
+  }finally{
+    if(sel) sel.disabled = false;
+  }
+}
+async function editAccountNote(uid){
+  const cur = (window.ACCOUNTS || []).find(a => a.uid === uid);
+  const next = prompt('账号备注（留空清除；可用来标记「批量」/「自用」）:', (cur && cur.note) || '');
+  if(next === null) return;
+  try{
+    await postJSON('/accounts/set', {uid: uid, note: next});
+    await loadAccounts();
+    toast(next.trim() ? '备注已保存' : '备注已清除', 'ok');
+  }catch(e){
+    toast('备注保存失败: ' + e.message, 'bad');
+  }
+}
 async function setAccountProduct(uid, prod, btn){
   const names = {
     'workbuddy': 'WorkBuddy 独立桌面客户端 (WB)',
@@ -6325,6 +6540,43 @@ async function setAccountProduct(uid, prod, btn){
   }
 }
 async function switchProduct(uid, btn){ return setAccountProduct(uid, 'workbuddy', btn); }
+// 一键切换所有出站身份：后端 /accounts/product 不带 uid / realm 就是全量
+// （含另一个版本），所以这里只负责挑下一个身分、并把当前身分显示在按钮上。
+const PRODUCT_ORDER = ['workbuddy', 'vscode', 'cli'];
+const PRODUCT_SHORT = {workbuddy: 'WB', vscode: 'VSC', cli: 'CLI'};
+function allProductsUniform(){
+  const list = window.ACCOUNTS || [];
+  if(!list.length) return null;
+  const first = list[0].product || 'workbuddy';
+  return list.every(a => (a.product || 'workbuddy') === first) ? first : null;
+}
+function updateProductAllButton(){
+  const label = document.getElementById('productAllLabel');
+  if(!label) return;
+  // 账号还没加载完时保持原样，别把按钮先写成「混合」再改回来。
+  if(!(window.ACCOUNTS || []).length) return;
+  const cur = allProductsUniform();
+  label.textContent = cur ? PRODUCT_SHORT[cur] : '混合';
+}
+async function cycleAllProducts(btn){
+  const list = window.ACCOUNTS || [];
+  if(!list.length){ toast('还没有账号', 'bad'); return; }
+  const cur = allProductsUniform();
+  // cur 为 null（各账号身分不一致）时落到第一项，等于「统一成 WB」。
+  const next = PRODUCT_ORDER[(PRODUCT_ORDER.indexOf(cur) + 1) % PRODUCT_ORDER.length];
+  const label = PRODUCT_SHORT[next];
+  if(!confirm('将把全部账号的出站身份切换为 ' + label + '？（含另一个版本）')) return;
+  if(btn) btn.disabled = true;
+  try{
+    await postJSON('/accounts/product', {product: next});
+    await loadAccounts();
+    toast('已把全部账号的出站身份切换为 ' + label, 'ok');
+  }catch(e){
+    toast('切换失败: ' + e.message, 'bad');
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
 
 async function refreshOne(uid, btn){
   if(btn){ btn.disabled = true; btn.textContent = '刷新中...'; }
@@ -7381,8 +7633,8 @@ async function refreshInner(gen){
         + '<td class="mono" style="font-size:11px;color:var(--dim)" data-label="账号" title="' + esc(r.account||'') + '">' + esc(acctName(r.account)) + '</td>'
         + '<td data-label="模式"><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
         + '<td data-label="结果">' + outcomeBadge(r) + '</td>'
-        + '<td data-label="耗时">' + (r.elapsed_ms!=null ? fmt(r.elapsed_ms)+' ms' : '—') + '</td>'
-        + '<td data-label="首字">' + (r.ttft_ms!=null ? fmt(r.ttft_ms)+' ms' : '—') + '</td>'
+        + '<td data-label="耗时">' + ms(r.elapsed_ms) + '</td>'
+        + '<td data-label="首字">' + ms(r.ttft_ms) + '</td>'
         + '<td data-label="速度">' + (r.tokens_per_sec ? r.tokens_per_sec.toFixed(1) : '—') + '</td>'
         + '<td data-label="输入">' + fmt(r.prompt_tokens) + '</td>'
         + '<td data-label="输出">' + fmt(r.completion_tokens) + '</td>'
@@ -8357,6 +8609,14 @@ async function loadSettings(showToast){
         remainingPriorityState.textContent = remainingPriority ? '(已启用)' : '(未启用)';
         remainingPriorityState.style.color = remainingPriority ? 'var(--accent2)' : 'var(--dim)';
       }
+      const egressBackoff = data.egress_backoff_enabled === true;
+      const egressBackoffInput = document.getElementById('setEgressBackoff');
+      if(egressBackoffInput) egressBackoffInput.checked = egressBackoff;
+      const egressBackoffState = document.getElementById('setEgressBackoffState');
+      if(egressBackoffState){
+        egressBackoffState.textContent = egressBackoff ? '(已启用)' : '(未启用)';
+        egressBackoffState.style.color = egressBackoff ? 'var(--accent2)' : 'var(--dim)';
+      }
     // Rebuild the editable rows, keeping stored values so an untouched field
     // is not accidentally blanked.
     API_KEY_ROWS = (data.api_keys || []).map(k => ({
@@ -8871,6 +9131,21 @@ async function saveRemainingPriority(btn){
   try {
     await postJSON('/settings/save', {remaining_priority_enabled: value});
     toast(value ? '已启用：剩余用量接近耗尽的组合优先调度' : '已关闭剩余用量优先调度', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function saveEgressBackoff(btn){
+  const el = document.getElementById('setEgressBackoff');
+  const value = !!(el && el.checked);
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {egress_backoff_enabled: value});
+    toast(value ? '已启用：出口级瞬时失败退避' : '已关闭出口级瞬时失败退避', 'ok');
     loadSettings();
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');
@@ -11126,20 +11401,22 @@ function renderAnalytics(data){
   const elTodayDetail = document.getElementById('kpiTodayTokensDetail');
   const elTodayTitle = document.getElementById('kpiRangeTokenTitle');
   if(elTodayTitle) elTodayTitle.textContent = rangeLabel() + '消耗 Token';
-  if(elTodayTok) elTodayTok.textContent = fmt(currentSum.total_tokens || 0);
+  if(elTodayTok) elTodayTok.textContent = fmtCompact(currentSum.total_tokens || 0);
   if(elTodayDetail) elTodayDetail.innerHTML =
-    '<span style="color:var(--accent)">输入 ' + fmt(currentSum.prompt_tokens || 0) + '</span>' +
-    ' <span style="color:var(--dim-light)">/</span> ' + '<span style="color:var(--accent2)">输出 ' + fmt(currentSum.completion_tokens || 0) + '</span>' +
-    ' <span style="color:var(--dim-light)">/</span> ' + '<span style="color:var(--think)">思考 ' + fmt(currentSum.reasoning_tokens || 0) + '</span>';
+    '<span style="color:var(--accent)">输入 ' + fmtCompact(currentSum.prompt_tokens || 0) + '</span>' +
+    ' <span style="color:var(--dim-light)">/</span> ' + '<span style="color:var(--accent2)">输出 ' + fmtCompact(currentSum.completion_tokens || 0) + '</span>' +
+    ' <span style="color:var(--dim-light)">/</span> ' + '<span style="color:var(--think)">思考 ' + fmtCompact(currentSum.reasoning_tokens || 0) + '</span>' +
+    ' <span style="color:var(--dim-light)">/</span> ' + '<span style="color:var(--ok)">缓存 ' + fmtCompact(currentSum.cached_tokens || 0) + '</span>';
 
   // KPI 2: always the all-time figure, as the stable reference next to KPI 1.
   const elTotalTok = document.getElementById('kpiTotalTokens');
   const elTotalDetail = document.getElementById('kpiTotalTokensDetail');
-  if(elTotalTok) elTotalTok.textContent = fmt(sumAll.total_tokens || 0);
+  if(elTotalTok) elTotalTok.textContent = fmtCompact(sumAll.total_tokens || 0);
   if(elTotalDetail) elTotalDetail.innerHTML =
-    '<span style="color:var(--accent)">输入 ' + fmt(sumAll.prompt_tokens || 0) + '</span>' +
-    ' <span style="color:var(--dim-light)">/</span> ' + '<span style="color:var(--accent2)">输出 ' + fmt(sumAll.completion_tokens || 0) + '</span>' +
-    ' <span style="color:var(--dim-light)">/</span> ' + '<span style="color:var(--think)">思考 ' + fmt(sumAll.reasoning_tokens || 0) + '</span>' +
+    '<span style="color:var(--accent)">输入 ' + fmtCompact(sumAll.prompt_tokens || 0) + '</span>' +
+    ' <span style="color:var(--dim-light)">/</span> ' + '<span style="color:var(--accent2)">输出 ' + fmtCompact(sumAll.completion_tokens || 0) + '</span>' +
+    ' <span style="color:var(--dim-light)">/</span> ' + '<span style="color:var(--think)">思考 ' + fmtCompact(sumAll.reasoning_tokens || 0) + '</span>' +
+    ' <span style="color:var(--dim-light)">/</span> ' + '<span style="color:var(--ok)">缓存 ' + fmtCompact(sumAll.cached_tokens || 0) + '</span>' +
     // 只有「所选范围已经覆盖了日志里的全部请求」这一种情况需要说明：两张卡数字
     // 相同不是计数器坏了，而是没有更早的数据。
     ((analyticsRange !== 'all' && (sumAll.total_tokens || 0) === (sumWindow.total_tokens || 0) && (sumAll.total_tokens || 0) > 0)
@@ -11150,17 +11427,17 @@ function renderAnalytics(data){
   const elAvgSpeed = document.getElementById('kpiAvgSpeed');
   const elAvgElapsed = document.getElementById('kpiAvgElapsed');
   if(elAvgSpeed) elAvgSpeed.innerHTML = (currentSum.speed_avg ? currentSum.speed_avg.toFixed(1) : '0.0') + ' <span style="font-size:12px;font-weight:400;color:var(--dim)">tok/s</span>';
-  if(elAvgElapsed) elAvgElapsed.textContent = '平均耗时 ' + (currentSum.elapsed_ms_avg ? (currentSum.elapsed_ms_avg / 1000).toFixed(2) + ' s' : '—');
+  if(elAvgElapsed) elAvgElapsed.textContent = '平均耗时 ' + ms(currentSum.elapsed_ms_avg);
 
   // KPI 4: 平均首字延迟，单独一张卡
   const elAvgLatency = document.getElementById('kpiAvgLatency');
-  if(elAvgLatency) elAvgLatency.innerHTML = currentSum.ttft_ms_avg
-    ? fmt(currentSum.ttft_ms_avg) + ' <span style="font-size:12px;font-weight:400;color:var(--dim)">ms</span>'
-    : '—';
+  if(elAvgLatency) elAvgLatency.textContent = ms(currentSum.ttft_ms_avg);
 
   // KPI 5: 缓存命中率
   const elCacheRate = document.getElementById('kpiCacheRate');
   if(elCacheRate) elCacheRate.textContent = (currentSum.cache_hit_pct != null ? currentSum.cache_hit_pct.toFixed(1) : '0.0') + '%';
+  const elCacheDetail = document.getElementById('kpiCacheDetail');
+  if(elCacheDetail) elCacheDetail.textContent = '缓存 ' + fmtCompact(currentSum.cached_tokens || 0) + ' tokens · 提示词前缀命中复用比';
 
   // KPI 6: 请求数（成功数）与 KPI 7: 成功率，拆成两张卡
   const elReqTitle = document.getElementById('kpiReqTitle');
@@ -11188,7 +11465,9 @@ function renderAnalytics(data){
   // 这里不能把「没有数」渲染成 ￥0.000。
   if(elCostValue) elCostValue.innerHTML = PRICING_ON
     ? fmtCostBoth(currentSum.cost_cny != null ? currentSum.cost_cny : 0, 14) : '—';
-  if(elCostDetail) elCostDetail.innerHTML = '按 OpenRouter 模型价折算的等价 token 花费';
+  if(elCostDetail) elCostDetail.innerHTML = (PRICING_ON && analyticsRange !== 'all' && sumAll.cost_cny != null)
+    ? '总计（全部历史）' + fmtCostBoth(sumAll.cost_cny, 11) + '<br>按 OpenRouter 模型价折算'
+    : '按 OpenRouter 模型价折算的等价 token 花费';
 
   // Table 1: 账号透视表
   const acctTbody = document.getElementById('analyticsAccountTbody');
@@ -11214,7 +11493,7 @@ function renderAnalytics(data){
           pills = entries.map(([mid, ms]) => {
             return '<span class="model-pill">'
               + '<b style="color:var(--fg)">' + esc(mid) + '</b>: '
-              + ms.requests + '次 · <b style="color:var(--accent)">' + fmt(ms.tokens) + '</b> tok'
+              + ms.requests + '次 · <b style="color:var(--accent)">' + fmtCompact(ms.tokens) + '</b> tok'
               + '</span>';
           }).join('');
         }
@@ -11240,7 +11519,7 @@ function renderAnalytics(data){
           + '<td>' + realmBadge + '</td>'
           + '<td>' + creditStr + '</td>'
           + '<td>' + fmt(st.requests || 0) + '</td>'
-          + '<td><b style="color:var(--accent)">' + fmt(st.total_tokens || 0) + '</b></td>'
+          + '<td><b style="color:var(--accent)">' + fmtCompact(st.total_tokens || 0) + '</b></td>'
           + '<td><b style="color:var(--accent2)">' + (st.credit != null ? Number(st.credit).toFixed(2) : '0.00') + '</b></td>'
           + '<td style="text-align:left;max-width:440px">' + pills + '</td>'
           + '<td class="pricing-col" style="color:var(--warn)" title="OpenRouter 价估算：按 OpenRouter 公布的模型价折算，覆盖该账号在所选区间内的请求；按条件定价的模型（输入长度阈值或时段）按每条请求取档；单条请求实际用的策略、三档单价与匹配来源见「最近请求」里那条的悬停提示">'
@@ -11297,14 +11576,14 @@ function keyModelPills(k){
   const pills = (k.models || []).map(m =>
     '<span class="model-pill">'
     + '<b style="color:var(--fg)">' + esc(m.model) + '</b>: '
-    + m.requests + '次 · <b style="color:var(--accent)">' + fmt(m.tokens) + '</b> tok'
+    + m.requests + '次 · <b style="color:var(--accent)">' + fmtCompact(m.tokens) + '</b> tok'
     + '</span>');
   const rest = k.models_other;
   if(rest){
     pills.push('<span class="model-pill">'
       + '<b style="color:var(--dim)">' + esc(rest.model || '(其他)') + '</b> '
       + '<span style="color:var(--dim)">' + (rest.models || 0) + ' 个模型 · </span>'
-      + rest.requests + '次 · ' + fmt(rest.tokens) + ' tok</span>');
+      + rest.requests + '次 · ' + fmtCompact(rest.tokens) + ' tok</span>');
   }
   return pills.length ? pills.join('') : '<span style="color:var(--dim)">无调用</span>';
 }
@@ -11358,13 +11637,13 @@ function renderKeyTable(data){
       + (st.errors ? '<span style="color:var(--bad);font-size:11px"> · 失败 ' + fmt(st.errors) + '</span>' : '')
       + '</td>';
     const tokCell = '<td data-label="消耗总 Token"><b style="color:var(--accent)">'
-      + fmt(st.total_tokens || 0) + '</b></td>';
+      + fmtCompact(st.total_tokens || 0) + '</b></td>';
     const splitCell = '<td data-label="输入 · 输出 · 思考" style="font-size:12px">'
-      + '<span style="color:var(--accent)">' + fmt(st.prompt_tokens || 0) + '</span>'
+      + '<span style="color:var(--accent)">' + fmtCompact(st.prompt_tokens || 0) + '</span>'
       + ' <span style="color:var(--dim-light)">/</span> '
-      + '<span style="color:var(--accent2)">' + fmt(st.completion_tokens || 0) + '</span>'
+      + '<span style="color:var(--accent2)">' + fmtCompact(st.completion_tokens || 0) + '</span>'
       + ' <span style="color:var(--dim-light)">/</span> '
-      + '<span style="color:var(--think)">' + fmt(st.reasoning_tokens || 0) + '</span>'
+      + '<span style="color:var(--think)">' + fmtCompact(st.reasoning_tokens || 0) + '</span>'
       + '</td>';
     const cacheCell = '<td data-label="缓存命中">'
       + (st.cache_hit_pct != null ? st.cache_hit_pct.toFixed(1) : '0.0') + '%</td>';

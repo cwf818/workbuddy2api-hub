@@ -27,9 +27,12 @@ dashboard.html
 start-wb-proxy.bat
 start-wb-proxy.command
 start-wb-proxy.sh
+restart-wb-proxy.bat
 start-wb-proxy-lan.bat
 start-wb-proxy-lan.command
+restart-wb-proxy.command
 start-wb-proxy-lan.sh
+restart-wb-proxy.sh
 allow-firewall.bat
 allow-firewall.command
 
@@ -42,6 +45,7 @@ wb_activity.py
 wb_agents.py
 wb_atrest.py
 wb_catalog.py
+wb_egress.py
 wb_fingerprint.py
 wb_identity.py
 wb_ipintel.py
