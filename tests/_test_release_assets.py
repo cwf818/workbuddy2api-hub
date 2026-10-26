@@ -40,7 +40,8 @@ import release_tools as tools  # noqa: E402
 # reads them from tests.yml rather than from this tuple - this is the
 # expectation the reader checks that derivation against.
 EXPECTED_LEGS = (
-    "ubuntu-latest / python 3.9",
+    # Pinned because ubuntu-latest moved to 26.04, which has no 3.9 build.
+    "ubuntu-24.04 / python 3.9",
     "ubuntu-latest / python 3.12",
     "windows-latest / python 3.12",
 )
@@ -246,7 +247,7 @@ class ManifestTests(unittest.TestCase):
 
     def test_launchers_and_dashboard_are_listed(self):
         listed = tools.read_manifest()
-        for name in ("dashboard.html", "wb_proxy.py", "README.md", "LICENSE",
+        for name in ("dashboard.html", "console_tail.py", "wb_proxy.py", "README.md", "LICENSE",
                      "start-wb-proxy.bat", "start-wb-proxy.sh",
                      "start-wb-proxy.command", "start-wb-proxy-lan.sh"):
             self.assertIn(name, listed)
@@ -297,6 +298,26 @@ class ManifestTests(unittest.TestCase):
             self.assertNotIn(name, listed)
 
 
+class VisibleLauncherTests(unittest.TestCase):
+    """Issue #559: the silent default stays, the console entry is opt-in."""
+
+    def test_wrappers_select_the_console_branch(self):
+        for wrapper, target in (
+                ("start-wb-proxy-visible.bat", "start-wb-proxy.bat"),
+                ("start-wb-proxy-lan-visible.bat", "start-wb-proxy-lan.bat")):
+            text = read(wrapper)
+            self.assertIn('set "WB_LAUNCH_MODE=console"', text)
+            self.assertIn('call "%~dp0' + target + '" %*', text)
+
+    def test_main_launchers_check_the_mode_before_pythonw(self):
+        for name in ("start-wb-proxy.bat", "start-wb-proxy-lan.bat"):
+            text = read(name)
+            mode = text.find('if /i "%WB_LAUNCH_MODE%"=="console" goto use_python')
+            pythonw = text.find("prefer pythonw")
+            self.assertGreaterEqual(mode, 0, name)
+            self.assertGreater(pythonw, mode, name)
+
+
 class RuntimeTrimTests(unittest.TestCase):
     """The trim rules reproduce the runtime the existing package ships."""
 
@@ -327,13 +348,13 @@ class RuntimeTrimTests(unittest.TestCase):
         for rel in ("Lib/multiprocessing", "Lib/tkinter/__init__.py", "Lib/idlelib/idle.py",
                     "Lib/site-packages/pip/__init__.py", "Lib/venv/__init__.py",
                     "Scripts/pip.exe", "include/Python.h", "libs/python312.lib",
-                    "tcl/tk8.6/init.tcl", "pythonw.exe", "python312.pdb",
+                    "tcl/tk8.6/init.tcl", "python312.pdb",
                     "DLLs/_tkinter.pyd", "DLLs/tcl86t.dll", "DLLs/tk86t.dll",
                     "DLLs/zlib1.dll", "DLLs/_testcapi.pyd", "Lib/__pycache__/os.cpython-312.pyc"):
             self.assertFalse(portable_runtime.keep(rel), "%s 应该被裁掉" % rel)
 
     def test_what_the_launchers_need_survives(self):
-        for rel in ("python.exe", "python3.dll", "python312.dll", "vcruntime140.dll",
+        for rel in ("python.exe", "pythonw.exe", "python3.dll", "python312.dll", "vcruntime140.dll",
                     "LICENSE.txt", "Lib/os.py", "Lib/ssl.py", "Lib/sqlite3/__init__.py",
                     "DLLs/_socket.pyd", "DLLs/_ssl.pyd", "DLLs/libssl-3-x64.dll",
                     "DLLs/_ctypes.pyd", "DLLs/libffi-8.dll"):
@@ -434,6 +455,14 @@ class PortableZipTests(unittest.TestCase):
             self.assertEqual(manifest["runtime"]["prefix"], "python/")
             self.assertEqual(manifest["runtime"]["python"], portable_runtime.RUNTIME_VERSION)
             self.assertGreater(manifest["runtime"]["files"], 0)
+            # #573: an image / rootfs deployment only owns the app layer; the
+            # launchers and the bundled pricing snapshot are portable-only.
+            app = manifest["profiles"]["app"]
+            self.assertIn("wb_proxy.py", app)
+            self.assertIn("dashboard.html", app)
+            self.assertNotIn("pricing/pricing.json", app)
+            self.assertNotIn("start-wb-proxy.bat", app)
+            self.assertTrue(set(app) <= set(files))
 
     def test_the_launchers_look_where_the_runtime_is(self):
         # The packaged path and the path the launcher probes have to agree, or
@@ -837,6 +866,33 @@ class ReleaseWorkflowTests(unittest.TestCase):
             stripped = line.strip()
             if stripped.startswith("wrt/") and (".ipk" in stripped or ".apk" in stripped):
                 self.fail("上传路径不能直接指向 wrt/：%s" % stripped)
+
+
+    def test_portable_scripts_have_lf_and_executable_mode(self):
+        # Issue #329: 检查便携包内脚本换行与执行权限
+        # *.sh 与 *.command 必须为 LF 且带有 0o755 执行权限；*.bat 必须为 CRLF
+        crlf = bytes([13, 10])
+        with tempfile.TemporaryDirectory(prefix="wb-test-eol-") as tmp:
+            rt = os.path.join(tmp, "python")
+            make_runtime(rt)
+            out_zip = os.path.join(tmp, "out.zip")
+            ver = tools.source_version(ROOT)
+            tools.build_portable(ver, "v" + ver, out_zip, source=ROOT, runtime_dir=rt)
+            with zipfile.ZipFile(out_zip, "r") as zf:
+                for info in zf.infolist():
+                    name_lower = info.filename.lower()
+                    mode = (info.external_attr >> 16) & 0o777
+                    if name_lower.endswith((".sh", ".command")):
+                        content = zf.read(info)
+                        self.assertNotIn(crlf, content, f"{info.filename} 包含 CRLF 换行符")
+                        self.assertEqual(mode, 0o755, f"{info.filename} 权限不是 0o755 (got {oct(mode)})")
+                    elif name_lower.endswith(".bat"):
+                        content = zf.read(info)
+                        self.assertIn(crlf, content, f"{info.filename} 必须包含 CRLF 换行符")
+                        self.assertEqual(mode, 0o755, f"{info.filename} 权限不是 0o755")
+                    elif name_lower.endswith(".py"):
+                        content = zf.read(info)
+                        self.assertNotIn(crlf, content, f"{info.filename} 必须为 LF 换行符")
 
 
 if __name__ == "__main__":

@@ -99,7 +99,7 @@ class PromptSettingsTests(unittest.TestCase):
     def test_defaults_are_passthrough(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(wb_settings.prompt_config(directory),
-                             {"mode": "passthrough", "file": ""})
+                             {"mode": "passthrough", "file": "", "text": ""})
 
     def test_roundtrip_and_validation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -118,7 +118,7 @@ class PromptSettingsTests(unittest.TestCase):
             with open(wb_settings.settings_path(directory), "w", encoding="utf-8") as fh:
                 json.dump({"prompt": {"mode": "BOGUS", "file": 7}}, fh)
             self.assertEqual(wb_settings.prompt_config(directory),
-                             {"mode": "passthrough", "file": ""})
+                             {"mode": "passthrough", "file": "", "text": ""})
         with tempfile.TemporaryDirectory() as directory:
             with open(wb_settings.settings_path(directory), "w", encoding="utf-8") as fh:
                 json.dump({"prompt": []}, fh)

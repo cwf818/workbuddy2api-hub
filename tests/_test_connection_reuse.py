@@ -6,6 +6,13 @@ then parsed the leftover JSON as its request line and failed - surfacing as a
 bogus "414 Request-URI Too Long" with an empty request line in the log, on an
 otherwise healthy connection.
 
+The same desync has a second entry point: a panel route that answers 200 without
+parsing the `{}` body its button posts. The leftover two bytes then become the
+next request line ("{}GET /usage?..." -> 501), which the dashboard shows as
+"cannot reach the reverse proxy" while everything behind it is healthy. Both
+shapes are covered here, because both are invisible to an HTTP client library
+that silently opens a fresh connection.
+
 Any client using a connection pool hits this as "random" failures that
 disappear on retry, which is why it is worth a standing test. A raw socket is
 required: an HTTP client library would silently open a fresh connection and
@@ -57,6 +64,10 @@ def check(label, ok, detail=""):
 # stalled one fails the suite instead of holding the job until the runner's own
 # timeout fires.
 RESPONSE_DEADLINE = 15.0
+
+# 面板会话口令：这一套件要用带 `{}` body 的面板按钮验证连接是否保持同步，而
+# 那些路由都要面板身份。口令只存在于临时 store 里，跑完随目录删掉。
+PANEL_PASSWORD = "conn-reuse-suite"
 
 
 class IncompleteResponse(Exception):
@@ -152,9 +163,13 @@ with open(os.path.join(store, "settings.json"), "w", encoding="utf-8") as fh:
 # its port held.
 proc = life.spawn_managed(
     [PY, os.path.join(ROOT, "wb_proxy.py"), "--port", str(port), "--host", "127.0.0.1",
-     "--accounts-dir", store],
+     "--accounts-dir", store, "--panel-password", PANEL_PASSWORD],
     cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
-    env=dict(os.environ, WB_PROXY_USAGE_DIR=os.path.join(work, "usage")))
+    env=dict(os.environ, WB_PROXY_USAGE_DIR=os.path.join(work, "usage"),
+             # 更新检查的仓库指向一个不存在的域名：/updates/check 的排空行为要测，
+             # 但这一套件不该碰网络，也不该吃 GitHub 的匿名配额。域名解析必然失败，
+             # 检查本身按契约返回 200 + last_error。
+             WB_UPDATE_REPO="offline.invalid/none"))
 
 
 def wait_ready():
@@ -190,6 +205,59 @@ def send_pair(bad_body, label):
             b"Authorization: Bearer GOODKEY\r\nContent-Type: application/json\r\n"
             b"Content-Length: " + str(len(small)).encode() + b"\r\n\r\n" + small
         )
+        try:
+            second = read_response(sock)
+        except Exception as exc:
+            second = ("recv error: %s" % exc).encode()
+    finally:
+        sock.close()
+
+    first_line = first.split(b"\r\n", 1)[0].decode("latin-1") if first else "<closed>"
+    second_line = second.split(b"\r\n", 1)[0].decode("latin-1") if second else "<closed>"
+    print("      first:  %s" % first_line)
+    print("      second: %s" % second_line)
+    return first, second
+
+
+def panel_login():
+    """Open a panel session; returns its token, or None when it was refused."""
+    body = json.dumps({"password": PANEL_PASSWORD}).encode()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=20)
+    try:
+        sock.sendall(b"POST /panel/login HTTP/1.1\r\nHost: x\r\n"
+                     b"Content-Type: application/json\r\n"
+                     b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        resp = read_response(sock)
+    finally:
+        sock.close()
+    head, _, payload = resp.partition(b"\r\n\r\n")
+    if b" 200 " not in head.split(b"\r\n", 1)[0]:
+        return None
+    try:
+        return json.loads(payload.decode("utf-8")).get("token")
+    except ValueError:
+        return None
+
+
+def send_panel_pair(path, token):
+    """`{}` to a body-less panel route, then a good panel GET, same socket.
+
+    The body is what the dashboard's buttons actually send (`postJSON(path, {})`):
+    two bytes the route never parses. The GET that follows stands in for the
+    panel's next poll, which is what used to be answered with a 501.
+    """
+    sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+    try:
+        sock.sendall(
+            b"POST " + path.encode() + b" HTTP/1.1\r\nHost: x\r\n"
+            b"X-Panel-Token: " + token.encode() + b"\r\n"
+            b"Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+        # /updates/check 会去问一次发布（这里的仓库指向不存在的域名，按契约 5s
+        # 封顶、失败也只回状态），所以给它单独的、更宽的截止时间。
+        first = read_response(sock, deadline=30.0)
+        sock.sendall(
+            b"GET /usage?realm=intl HTTP/1.1\r\nHost: x\r\n"
+            b"X-Panel-Token: " + token.encode() + b"\r\n\r\n")
         try:
             second = read_response(sock)
         except Exception as exc:
@@ -302,6 +370,29 @@ try:
         finally:
             quiet.close()
             peer.close()
+
+    # The other entry point into the same desync: a panel route that answers 200
+    # without parsing the `{}` body its button posts. The two leftover bytes then
+    # become the next request line, and the dashboard's next poll gets a 501 -
+    # which it renders as "cannot reach the reverse proxy" on a healthy gateway.
+    # /shutdown belongs to the same set but stops the server, so it is not driven
+    # here; /updates/check is the one that bites in the field, so it is.
+    print("[7] a body-less panel POST keeps the connection in sync")
+    token = panel_login()
+    check("the panel session opened", bool(token))
+    if token:
+        for path, want in (("/console/toggle", b"200"),
+                           ("/updates/check", b"200"),
+                           ("/updates/install", b"409"),
+                           ("/quota-scan/run", b"200")):
+            first, second = send_panel_pair(path, token)
+            check("POST %s answered %s" % (path, want.decode()),
+                  want in first.split(b"\r\n", 1)[0],
+                  first.split(b"\r\n", 1)[0].decode("latin-1", "replace"))
+            check("the request after %s still parsed (not 501)" % path,
+                  second.startswith(b"HTTP/1.1 200")
+                  and b"501" not in second.split(b"\r\n", 1)[0],
+                  second.split(b"\r\n", 1)[0].decode("latin-1", "replace"))
 finally:
     life.stop_managed(proc)
     shutil.rmtree(work, ignore_errors=True)

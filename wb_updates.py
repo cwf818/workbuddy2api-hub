@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
-"""wb_updates.py — 更新发现（只发现，不安装）。
+"""wb_updates.py — 稳定版更新发现。
 
-这个模块回答一个问题：官方仓库有没有比当前运行版本更新的稳定版？
+这个模块回答一个问题：配置的 GitHub 仓库有没有比当前运行版本更新的稳定版？
 
-它**只做发现**：拉一次 GitHub 的 releases 元数据（API 拿不到就退回网页端点）、
-比较版本号、把结论交给面板。不下载、不解包、不替换文件、不重启进程——那些属于
-后续阶段。
+它只负责发现更新。安装请求由另一个 panel-only 路由交给受限 systemd 服务；
+这个模块本身仍不下载、不解包、不替换文件，也不重启进程。
 
 三条硬约束：
 
 1. **默认关闭**。每日检查是 operator 显式打开的偏好；缺键、false 都是关闭，
-   关闭时后台一个请求都不发。
+   关闭时后台一个请求都不发。打开后，进程每次启动补问一次（tag 与发布页不落盘，
+   重启不补就问不回来），一小时最多补 6 次以免崩溃重启循环刷配额，稳态下仍是
+   每 24 小时一次。
 2. **失败不致命**。网络超时、HTTP 错误、JSON 坏了都只记一行短原因，网关照常
    服务；后台检查永远不挡请求路径。
 3. **只留安全运维字段**。落盘的只有「上次尝试时间 / 上次成功时间 / 见过的版本
@@ -29,23 +30,45 @@ import urllib.request
 
 import wb_settings
 
-# 官方仓库的 releases 接口——主路径。走 API 不抓 HTML：页面结构变了不该让检查失效。
-RELEASES_URL = "https://api.github.com/repos/ardeyouxipianyi/workbuddy2api-hub/releases"
+# 默认仍指向官方仓库。自建 fork 的 systemd 服务可通过 WB_UPDATE_REPO 指定
+# 自己的 Release 源；该值只允许 owner/repo 形状，避免把更新请求导向任意主机。
+DEFAULT_REPOSITORY = "ardeyouxipianyi/workbuddy2api-hub"
+REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+
+
+def configured_repository():
+    value = str(os.environ.get("WB_UPDATE_REPO") or DEFAULT_REPOSITORY).strip()
+    return value if REPOSITORY_RE.fullmatch(value) else DEFAULT_REPOSITORY
+
+
+REPOSITORY = configured_repository()
+# 主路径走 Releases API；页面结构变化不应让更新检查失效。
+RELEASES_URL = "https://api.github.com/repos/%s/releases" % REPOSITORY
 # 回退路径：网页端点的 302 Location 末尾就是最新稳定版 tag。它按网页计流量，
 # 不受 API 那 60 次/小时/出口 IP 的匿名配额限制，也不需要凭据。
-LATEST_RELEASE_URL = "https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases/latest"
+LATEST_RELEASE_URL = "https://github.com/%s/releases/latest" % REPOSITORY
 TAG_RE = re.compile(r"/releases/tag/([^/?#]+)")
 # 可选凭据：认证请求的配额是 5000 次/小时。只从环境变量读，绝不落盘
 # （模块头第 3 条）。
 TOKEN_ENV = "GITHUB_TOKEN"
 USER_AGENT = "wb2api-hub-update-check"
-REQUEST_TIMEOUT = 5
+# 回退路径是 302 跳转 + 对象存储下载，代理出口下实测 4.2~10s；5s 会把
+# 本可成功的回退请求掐掉，两条路径全挂才报「更新检查失败」。10s 留足
+# 余量又不至于让坏响应挂住面板（检查本身有 24h 节流，失败下个窗口重试）。
+REQUEST_TIMEOUT = 10
 # 一份 releases 文档几十 KB；给足余量但设上限，坏响应不能把内存拉满。
 MAX_BODY = 2 * 1024 * 1024
 
 # 每日检查的节流窗口。约 24 小时：重启不会让检查变得频繁，也不会因为一次
 # 失败就整天不再试。
 SCHEDULED_INTERVAL_SECONDS = 24 * 3600
+# 启动补检查的预算：一小时内最多补几次。重启是低频事件，正常的「点检查 → 点安装
+# → 执行者重启」一次只花掉一个额度，所以永远不会被自己的保护挡住；而崩溃重启
+# 循环会在用光预算后停手，不至于把匿名 API 配额（60 次/小时/出口 IP）刷穿。
+# 用预算而不是「最小间隔」，是因为保护要挡的场景（几秒一次的重启）和要放行的
+# 场景（检查到重启只隔十几秒）在时间尺度上完全重叠。
+STARTUP_CHECK_WINDOW_SECONDS = 3600.0
+STARTUP_CHECKS_PER_WINDOW = 6
 # 启动后先等一会儿再花掉这个请求，让监听端口和账号池先就绪。
 FIRST_DELAY_SECONDS = 30
 # 后台线程醒来的间隔。真正的节流靠 due() 判断，这里只决定「多久看一眼」。
@@ -213,6 +236,7 @@ class UpdateChecker(threading.Thread):
         self._last_error = ""
         self._last_attempt = 0.0
         self._last_success = 0.0
+        self._startup_checks = []
         self._load_state()
 
     # ---- 状态 -----------------------------------------------------------
@@ -224,6 +248,7 @@ class UpdateChecker(threading.Thread):
             return
         self._last_attempt = state.get("last_attempt") or 0.0
         self._last_success = state.get("last_success") or 0.0
+        self._startup_checks = [float(stamp) for stamp in state.get("startup_checks") or []]
         version = state.get("latest_version") or ""
         if version:
             self._latest = {
@@ -254,12 +279,42 @@ class UpdateChecker(threading.Thread):
             return True
         return (now - self._last_attempt) >= SCHEDULED_INTERVAL_SECONDS
 
+    def startup_due(self, now=None):
+        """启动后那次补检查是否该跑。
+
+        与 `due()` 的 24 小时窗口无关——重启时窗口往往还没放行，而 tag / 发布页
+        只在内存里，不补这一次，面板就会显示「有新版本」却要求先手动检查。
+
+        保护用**预算**：一小时内最多补 `STARTUP_CHECKS_PER_WINDOW` 次。这样正常
+        流程（点检查 → 点安装 → 执行者重启，全程十几秒）永远不会被挡住，而崩溃
+        重启循环用光额度后停手。开关仍然优先：每日检查关掉时启动也不发请求。
+        """
+        if not self.enabled():
+            return False
+        now = time.time() if now is None else float(now)
+        if not self._last_attempt:
+            return True
+        window = now - STARTUP_CHECK_WINDOW_SECONDS
+        spent = len([stamp for stamp in self._startup_checks if stamp > window])
+        return spent < STARTUP_CHECKS_PER_WINDOW
+
+    def _note_startup_check(self):
+        """把这次启动补检查记进预算。记账失败不影响这次检查本身。"""
+        stamp = time.time()
+        self._startup_checks = sorted(self._startup_checks + [stamp])[
+            -wb_settings.STARTUP_CHECK_STAMPS_KEPT:]
+        try:
+            wb_settings.record_startup_check(self.settings_dir, at=stamp)
+        except Exception:
+            pass
+
     def status(self):
         picked = self._latest or {}
         latest = picked.get("version") or ""
         return {
             "current_version": self.current_version,
             "latest_version": latest or None,
+            "latest_tag": picked.get("tag") or "",
             "update_available": is_newer(latest, self.current_version),
             "enabled": self.enabled(),
             "checking": self._checking,
@@ -279,12 +334,13 @@ class UpdateChecker(threading.Thread):
             pass
 
     # ---- 检查 -----------------------------------------------------------
-    def check(self, manual=False):
+    def check(self, manual=False, startup=False):
         """跑一次发现，返回状态字典。
 
-        `manual=True` 绕过开关和 24 小时窗口：操作员点了「立即检查」就必须真的
-        去问一次。`manual=False` 是后台路径，关闭或没到点就直接返回，一个请求
-        都不发。
+        `manual=True` 绕过开关和两个窗口：操作员点了「立即检查」就必须真的去问
+        一次。`startup=True` 是进程起来后的第一次（绕过 24 小时窗口，但仍受开关
+        与每小时预算约束）。其余是稳态的后台路径：关闭或没到点就直接返回，一个
+        请求都不发。
 
         同步执行，耗时由 fetcher 的超时封顶；它不持有任何请求路径要等的锁。
         """
@@ -293,7 +349,12 @@ class UpdateChecker(threading.Thread):
             if not self.enabled():
                 status["skipped"] = "disabled"
                 return status
-            if not self.due():
+            if startup:
+                if not self.startup_due():
+                    status["skipped"] = "startup budget spent"
+                    return status
+                self._note_startup_check()
+            elif not self.due():
                 status["skipped"] = "not due yet"
                 return status
         with self._lock:
@@ -349,9 +410,12 @@ class UpdateChecker(threading.Thread):
         # 先让监听端口和账号池就绪，再花掉第一个请求。
         if self._stop_event.wait(self._first_delay):
             return
+        # 第一次是启动补检查：窗口没放行也问一次，否则重启后拿不到可安装的 tag。
+        startup = True
         while not self._stop_event.is_set():
             try:
-                self.check(manual=False)
+                self.check(manual=False, startup=startup)
             except Exception as exc:
                 self.log("更新检查异常：%s" % describe_failure(exc))
+            startup = False
             self._park(self._poll_seconds)

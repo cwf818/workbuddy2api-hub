@@ -76,6 +76,20 @@ class CockpitRowTests(unittest.TestCase):
 
 
 class CockpitPoolImportTests(unittest.TestCase):
+    def test_bare_snake_case_object_is_accepted(self):
+        # #556: the outer container check only knew camelCase, so a single
+        # cockpit row was rejected before normalise_import_row could map it.
+        rows, error = wb_accounts._coerce_account_rows(cockpit_row())
+        self.assertEqual(error, "")
+        self.assertEqual(len(rows), 1)
+        kwargs = wb_accounts.normalise_import_row(rows[0])
+        self.assertEqual(kwargs["accessToken"], fake_jwt())
+
+    def test_bare_camel_case_object_still_accepted(self):
+        rows, error = wb_accounts._coerce_account_rows({"accessToken": fake_jwt()})
+        self.assertEqual(error, "")
+        self.assertEqual(len(rows), 1)
+
     def test_import_rows_adds_cockpit_accounts(self):
         with tempfile.TemporaryDirectory() as directory:
             pool = wb_accounts.AccountPool(directory)

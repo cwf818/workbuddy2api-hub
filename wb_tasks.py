@@ -13,11 +13,15 @@ import urllib.error
 import urllib.request
 
 import wb_accounts as _accounts
+import wb_identity
 
-CHAT_BASE = "https://copilot.tencent.com"
+# 默认 https://copilot.tencent.com；WB_CN_CHAT_UPSTREAM 可覆盖（见 wb_identity.CN_CHAT_BASE）。
+CHAT_BASE = wb_identity.CN_CHAT_BASE
 BILL_BASE = "https://www.codebuddy.cn"
 WEB_BASE = "https://www.workbuddy.cn"
-DESKTOP_UA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+#: 本模块只跑国内版，桌面端 UA 与 wb_identity 同一来源，避免两处各写一份
+#: 版本号（国际版 5.8.4 对齐时就是这么漏掉一份的）。
+DESKTOP_UA = wb_identity.DESKTOP_UA_CN
 WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 
 
@@ -54,6 +58,11 @@ TASK_SPECS = {
     # first_buddy 是 auto 类（上游不接受接取），完成后领奖才发放 Buddy 实例；
     # 它是所有 single 任务与猫猫旅行的前置（"prerequisite not met: first_buddy"）。
     "first_buddy": {"kind": "chat", "target": 1, "reward": 300, "name": "领取一只 Buddy"},
+    # 活动任务：在专家页召唤「无畏契约拼豆专家」并完成一次对话。事件里的 id
+    # 必须是这个专家的真实 id，否则上游只接受事件但不推进进度。
+    "WorkBuddy_Valorant": {"kind": "expert", "target": 1, "reward": 100,
+                           "expert": ("ex_xQHHD1u5Jkua", "无畏契约拼豆专家"),
+                           "name": "体验「无畏契约拼豆专家」"},
     "wb_wechat_oa_subscribe_task": {"unforgeable": True, "reward": 100,
                                     "reason": "需在微信关注「腾讯 WorkBuddy」公众号满 24 小时",
                                     "name": "关注官方公众号"},
@@ -192,7 +201,9 @@ def fetch_streak_days(account):
     失败返回 None，不发写请求。供对话活跃上报后回显连登天数使用。
     """
     try:
-        req = urllib.request.Request(CHAT_BASE + "/activity/growth/streak",
+        # 成长体系国内国际都有，端点跟着身分走：国际版是 www.workbuddy.ai。
+        base = account.chat_base_url() if hasattr(account, "chat_base_url") else CHAT_BASE
+        req = urllib.request.Request(base + "/activity/growth/streak",
                                      headers=account.headers("chat"))
         with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
             d = json.loads(resp.read().decode("utf-8"))
@@ -522,7 +533,7 @@ def do_cat_travel(account):
     return {"ok": True, "action": state, "msg": f"当前状态: {state}"}
 
 
-def _progress_one(account, t, logs, gap):
+def _progress_one(account, t, logs, gap, claim=True):
     """推进单个任务并返回本次到账积分。
 
     auto 类任务不需要接取（上游 "task does not require acceptance"），事件可
@@ -546,6 +557,9 @@ def _progress_one(account, t, logs, gap):
     # (例如用户自己在桌面端用了一次, 或夜里调度器点亮了), 这类任务必须
     # 先结算, 不能因为"只能靠真实操作"就直接跳过丢掉奖励。
     if status == "completed" or cur >= tgt:
+        if not claim:
+            logs.append(f"⏸ 任务 [{spec['name']}] 已达成，等待手动领取")
+            return 0
         res = claim_task(account, code)
         if res.get("ok"):
             cr = res.get("credit", 0)
@@ -583,9 +597,10 @@ def _progress_one(account, t, logs, gap):
     id_pool = None
     if kind in ("expert", "team"):
         id_pool = TEAM_ID_POOL if kind == "team" else EXPERT_ID_POOL
+    fixed_expert = spec.get("expert")
     for i in range(need):
-        expert = None
-        if id_pool:
+        expert = fixed_expert
+        if expert is None and id_pool:
             pid, pnm = id_pool[(cur + i) % len(id_pool)]
             expert = (pid, pnm)
         ev = build_event(account, kind, idx=i, expert=expert)
@@ -620,6 +635,10 @@ def _progress_one(account, t, logs, gap):
         return 0
 
     # 领奖
+    if not claim:
+        logs.append(f"⏸ 任务 [{spec['name']}] 已点亮，等待手动领取")
+        time.sleep(gap)
+        return 0
     res = claim_task(account, code)
     if res.get("ok"):
         cr = res.get("credit", 0)
@@ -631,8 +650,11 @@ def _progress_one(account, t, logs, gap):
     return 0
 
 
-def run_growth_tasks(account, gap=1.0):
-    """完整执行批量成长任务点亮与领奖。"""
+def run_growth_tasks(account, gap=1.0, claim=True):
+    """完整执行批量成长任务点亮与领奖。
+
+    claim=False 只推进进度、不领奖，让用户自己挑时间领取（#507）。
+    """
     if account.realm != "cn":
         return {"ok": False, "msg": "国际版不适用国内成长任务中心", "logs": []}
     if getattr(account, "is_enterprise", lambda: False)():
@@ -652,7 +674,7 @@ def run_growth_tasks(account, gap=1.0):
     #    否则 single 任务接取会报 "prerequisite not met: first_buddy"。
     for t in tasks:
         if t.get("task_type") == "auto":
-            total_earned += _progress_one(account, t, logs, gap)
+            total_earned += _progress_one(account, t, logs, gap, claim=claim)
 
     # 1. 批量接取未接任务（auto 类不接受接取，unforgeable 无法自动化）
     def _needs_accept(x):
@@ -694,7 +716,7 @@ def run_growth_tasks(account, gap=1.0):
     for t in tasks:
         if t.get("task_type") == "auto":
             continue
-        total_earned += _progress_one(account, t, logs, gap)
+        total_earned += _progress_one(account, t, logs, gap, claim=claim)
 
     # 3. 顺手检查猫猫旅行
     tr_res = do_cat_travel(account)

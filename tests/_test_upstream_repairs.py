@@ -149,6 +149,21 @@ check("non-deepseek models are untouched",
       "thinking" not in non_deepseek and "reasoning_effort" not in non_deepseek,
       (non_deepseek.get("thinking"), non_deepseek.get("reasoning_effort")))
 
+try:
+    os.environ["WB_DEFAULT_REASONING_EFFORT"] = "off"
+    off_body = deepseek_body()
+    check("the default effort can be turned off",
+          "reasoning_effort" not in off_body, off_body.get("reasoning_effort"))
+
+    os.environ["WB_DEFAULT_REASONING_EFFORT"] = "catalog"
+    catalog_body = deepseek_body()
+    expected = P.model_default_effort("deepseek-v4.1-flash")
+    check("catalog mode uses only the catalog default",
+          catalog_body.get("reasoning_effort") == expected,
+          (catalog_body.get("reasoning_effort"), expected))
+finally:
+    os.environ.pop("WB_DEFAULT_REASONING_EFFORT", None)
+
 print()
 print("[3] tool pairing: repack results, drop orphans")
 
@@ -166,6 +181,16 @@ check("result order is preserved",
       [m.get("tool_call_id") for m in fixed if m.get("role") == "tool"] == ["c0", "c1"])
 check("the intruder is kept, only moved",
       any(m.get("content") == "<image_resize_notice>" for m in fixed))
+
+before_first = [{"role": "user", "content": "go"},
+                assistant_with_calls("c0"),
+                {"role": "developer", "content": "<notice>"},
+                tool_result("c0")]
+fixed_bf, changed_bf = P.repack_tool_result_blocks(copy.deepcopy(before_first))
+check("an intruder before the first result is moved", changed_bf)
+check("the result becomes adjacent in that case too",
+      [m.get("role") for m in fixed_bf[1:4]] == ["assistant", "tool", "developer"],
+      [m.get("role") for m in fixed_bf[1:4]])
 
 adjacent = [{"role": "user", "content": "go"},
             assistant_with_calls("c0"),
@@ -337,6 +362,36 @@ check("stream_responses_events drops the truncated done event",
 check("stream_responses_events marks the response incomplete",
       '"status": "incomplete"' in resp_raw)
 
+reason_only_stream = [
+    sse_line({"choices": [{"delta": {"reasoning_content": "thinking..."}}]}),
+    sse_line({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+]
+reason_holder = {"usage": None}
+reason_only_raw = b"".join(P.stream_responses_events(
+    iter(reason_only_stream), "m", reason_holder)).decode("utf-8")
+check("a reasoning-only stream emits response.failed",
+      "response.failed" in reason_only_raw, reason_only_raw[-500:])
+check("a reasoning-only stream does not emit response.completed",
+      "response.completed" not in reason_only_raw)
+check("a reasoning-only stream marks the holder",
+      reason_holder.get("empty_reasoning") is True)
+
+reason_chat = {"choices": [{"message": {
+    "role": "assistant", "content": "", "reasoning_content": "thinking"},
+    "finish_reason": "stop"}], "usage": {}}
+reason_resp = P.chat_to_response(reason_chat, "m", set(), {}, {})
+check("chat_to_response keeps the reasoning item",
+      any(o.get("type") == "reasoning" for o in reason_resp.get("output") or []))
+check("a reasoning-only Responses object is rejected",
+      P.reasoning_only_response(reason_resp))
+
+normal_chat = {"choices": [{"message": {
+    "role": "assistant", "content": "answer"}, "finish_reason": "stop"}],
+    "usage": {}}
+normal_resp = P.chat_to_response(normal_chat, "m", set(), {}, {})
+check("a normal answer is not rejected",
+      not P.reasoning_only_response(normal_resp))
+
 print()
 print("[4] integration: build_upstream_body applies the repairs")
 
@@ -386,6 +441,23 @@ check("it can be switched on with WB_PROMPT_CACHE_KEY=1",
 _os.environ["WB_PROMPT_CACHE_KEY"] = "0"
 check("and switched back off", P.prompt_cache_key_enabled() is False)
 del _os.environ["WB_PROMPT_CACHE_KEY"]
+
+print()
+print("[6] chat body serialization is compact (official JSON.stringify shape)")
+
+raw = P.encode_upstream_body({"model": "m", "messages": [
+    {"role": "user", "content": "hi"}]})
+check("no whitespace between JSON tokens",
+      raw == b'{"model":"m","messages":[{"role":"user","content":"hi"}]}', raw)
+check("round-trips to the same object",
+      json.loads(raw.decode("utf-8"))["messages"][0]["content"] == "hi")
+check("non-ASCII stays UTF-8 instead of \\u escapes",
+      P.encode_upstream_body({"content": "\u4e2d\u6587"})
+      == b'{"content":"\xe4\xb8\xad\xe6\x96\x87"}',
+      P.encode_upstream_body({"content": "\u4e2d\u6587"}))
+check("compact output is shorter than the old default separators",
+      len(raw) < len(json.dumps({"model": "m", "messages": [
+          {"role": "user", "content": "hi"}]}, ensure_ascii=False).encode("utf-8")))
 
 print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))

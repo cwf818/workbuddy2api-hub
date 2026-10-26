@@ -42,8 +42,13 @@ const SETTINGS = {
   },
   pricing_enabled: false,
   pricing_refresh_minutes: 5,
+  section_max_height: 640,
   auto_switch_product: true,
+  identity: {private_data: 'false'},
   daily_chat_web: false,
+  daily_chat_web_timeout: 300,
+  daily_chat_web_timeout_default: 120,
+  daily_chat_web_attempts_default: 3,
   local_web_tools: true,
   remaining_priority_enabled: true,
   version: 'v1.6.14',
@@ -147,14 +152,27 @@ global.__toasts = toasts;
   assert.equal(element('setAccountsDir').textContent, '/data/accounts');
   assert.equal(element('setPricingState').textContent, '(每 5 分钟)');
   assert.equal(element('setAutoSwitch').checked, true);
+  assert.equal(element('setPrivateData').value, 'false');
+  assert.equal(element('setPrivateDataState').textContent, '(false)');
   assert.equal(element('setDailyChatWeb').checked, false);
+  // 预算模型：字段缺失时按默认（单账号 600 秒、单轮 300 秒、并发 1、启动补跑开）
+  // 显示；候选序列为空时是「自动」。
+  assert.equal(element('setDailyChatBudget').value, '600', '单账号预算没按默认写回');
+  assert.equal(element('setDailyChatTurnTimeout').value, '300', '单轮最长等待没写回');
+  assert.equal(element('setDailyChatWebConcurrency').value, '1', '并发数没写回');
+  assert.equal(element('setDailyChatStartupCatchup').checked, true, '启动补跑没按默认写回');
+  assert.equal(element('setDailyChatModelsState').textContent,
+    '(自动：首选 + 该区域免费模型)', '候选序列状态没写回');
   assert.equal(element('setLocalWebTools').checked, true);
   assert.equal(element('setRemainingPriority').checked, true,
     '剩余用量优先调度的复选框没写回');
   assert.equal(element('setRemainingPriorityState').textContent, '(已启用)');
   assert.equal(element('setLimitsPerRealm').checked, true, '有分版本覆盖时应勾上');
+  assert.equal(element('setWinMaxHeight').value, '640', '窗口限高输入框没写回');
+  assert.equal(element('setWinMaxHeightState').textContent, '(当前 640px)',
+    '窗口限高状态文案没写回');
 
-  realLog('loadSettings 完整性断言通过（16 项）');
+  realLog('loadSettings 完整性断言通过（18 项）');
 })().catch(e => {
   console.log = realLog;
   console.error(e && e.stack || e);

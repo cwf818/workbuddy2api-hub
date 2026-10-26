@@ -14,6 +14,12 @@ rem
 rem  NOTE: this script puts no %VAR% inside an if( ... ) block,
 rem  because a path containing ( or ) breaks the cmd.exe parser.
 rem  All checks use if/errorlevel/goto instead.
+rem
+rem  SILENT MODE: with a GUI-subsystem pythonw the service runs
+rem  with NO console window and nothing in the taskbar; closing
+rem  any window never stops it. A separate live log viewer opens
+rem  on top - closing the viewer only closes the viewer. When no
+rem  pythonw exists we fall back to the visible-window launcher.
 rem ===========================================================
 
 set "PORT=%~1"
@@ -21,9 +27,78 @@ if "%PORT%"=="" set "PORT=8788"
 set "KEY=%~2"
 set "HERE=%~dp0"
 set "SCRIPT=%HERE%wb_proxy.py"
+set "PYARGS=--port %PORT% --lan"
+if not "%KEY%"=="" set "PYARGS=%PYARGS% --api-key %KEY%"
 
 if not exist "%SCRIPT%" goto no_script
 
+rem ---- explicit visible-console mode ----
+rem The -visible.bat wrapper sets WB_LAUNCH_MODE=console; the default
+rem stays silent (pythonw + console_tail.py).
+if /i "%WB_LAUNCH_MODE%"=="console" goto use_python
+
+rem ---- prefer pythonw (GUI subsystem: no console window) ----
+if exist "%HERE%python\pythonw.exe" goto pyw_bundled
+if exist "%HERE%.venv\Scripts\pythonw.exe" goto pyw_venv
+pythonw --version >nul 2>nul
+if not errorlevel 1 goto pyw_path
+pyw --version >nul 2>nul
+if not errorlevel 1 goto pyw_path_pyw
+goto use_python
+
+:pyw_bundled
+set "PYW=%HERE%python\pythonw.exe"
+goto run_silent
+
+:pyw_venv
+set "PYW=%HERE%.venv\Scripts\pythonw.exe"
+goto run_silent
+
+:pyw_path
+set "PYW=pythonw"
+goto run_silent
+
+:pyw_path_pyw
+set "PYW=pyw"
+goto run_silent
+
+:run_silent
+rem The headless service writes its output to the null device, so a refused
+rem start ("a proxy already runs on this port") would otherwise leave this
+rem window vanishing with no explanation - it reads exactly like a crash.
+rem Ask first, in THIS window, reusing the same check the service runs.
+call :find_console_python
+if not defined VIEWERPY goto start_headless
+"%VIEWERPY%" "%SCRIPT%" %PYARGS% --probe-only
+if not errorlevel 3 goto refused_start
+
+:start_headless
+rem Launch the service headless: no console window, nothing in the
+rem taskbar, and closing any window never stops it.
+start "" "%PYW%" "%SCRIPT%" %PYARGS%
+
+rem Open a live log viewer in its own console window. The viewer
+rem waits quietly while the service starts and closes itself when
+rem the service is shut down. pythonw has no window, so a console
+rem python is needed for the viewer.
+if not defined VIEWERPY exit /b 0
+if not exist "%HERE%console_tail.py" exit /b 0
+start "" "%VIEWERPY%" "%HERE%console_tail.py" --port %PORT%
+exit /b 0
+
+:refused_start
+echo.
+echo  Nothing was started from this window - read the lines above.
+echo  To restart the copy that is already running, use
+echo  restart-wb-proxy.bat (it stops the old ones first).
+echo.
+pause
+exit /b 0
+
+:use_python
+rem ===========================================================
+rem  Visible-window launcher (fallback, pythonw unavailable)
+rem ===========================================================
 set "PYEXE="
 
 rem ---- 1) bundled runtime (ships with the zip) ----
@@ -100,16 +175,40 @@ echo   Keep this window open. Closing it stops the server.
 echo ===========================================================
 echo.
 
-rem Pass --api-key only when the user supplied one; otherwise the gateway
-rem mints a random key on first run and prints it below.
-if "%KEY%"=="" goto run_nokey
-"%PYEXE%" "%SCRIPT%" --port %PORT% --lan --api-key %KEY%
-goto after_run
+"%PYEXE%" "%SCRIPT%" %PYARGS%
 
-:run_nokey
-"%PYEXE%" "%SCRIPT%" --port %PORT% --lan
-
-:after_run
 echo.
 echo [server exited]
 pause
+exit /b 0
+
+rem ===========================================================
+rem  Console python lookup, shared by the start-up probe and the
+rem  log viewer. Invoked with "call :find_console_python"; leaves
+rem  VIEWERPY unset when no usable console python exists.
+rem ===========================================================
+:find_console_python
+set "VIEWERPY="
+if exist "%HERE%python\python.exe" goto fcp_bundled
+if exist "%HERE%.venv\Scripts\python.exe" goto fcp_venv
+python --version >nul 2>nul
+if not errorlevel 1 goto fcp_path
+py --version >nul 2>nul
+if not errorlevel 1 goto fcp_py
+goto :eof
+
+:fcp_bundled
+set "VIEWERPY=%HERE%python\python.exe"
+goto :eof
+
+:fcp_venv
+set "VIEWERPY=%HERE%.venv\Scripts\python.exe"
+goto :eof
+
+:fcp_path
+set "VIEWERPY=python"
+goto :eof
+
+:fcp_py
+set "VIEWERPY=py"
+goto :eof

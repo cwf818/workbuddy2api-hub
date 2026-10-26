@@ -44,8 +44,17 @@ def normalize_mode(value):
     return mode if mode in VALID_MODES else "passthrough"
 
 
-def load_prompt(mode, file_path=""):
-    """读取网关提示词：file 非空则读档（失败抛出，调用方 fail open），否则内置默认。"""
+def load_prompt(mode, file_path="", text=""):
+    """读取网关提示词：在线正文优先，其次 file，最后内置默认。
+
+    在线正文来自设置页的全局提示词输入框（settings.json 的 prompt.text）。
+    它比文件路径更适合容器部署：不必把文件挂进容器，改完即时生效。file 仍
+    保留给已有的部署；两者都为空时用内置默认。读档失败抛出，调用方 fail
+    open（与从前一致）。
+    """
+    inline = str(text or "")
+    if inline.strip():
+        return inline
     path = str(file_path or "").strip()
     if not path:
         return DEFAULT_PROMPT

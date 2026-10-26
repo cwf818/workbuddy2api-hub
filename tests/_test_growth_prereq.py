@@ -118,6 +118,14 @@ class GrowthPrereqTests(unittest.TestCase):
         self.assertEqual(seq[first_accept], ("accept", ("create_canvas",)))
         self.assertGreaterEqual(res["earned_credit"], 300)
 
+    def test_manual_claim_leaves_completed_tasks_unclaimed(self):
+        self._stub()
+        res = T.run_growth_tasks(FakeAccount(), gap=0, claim=False)
+        self.assertFalse([e for e in self.events if e[0] == "claim"], self.events)
+        self.assertEqual(res["earned_credit"], 0)
+        # first_buddy 已完成但没领奖，状态停在 completed，等用户手动领取。
+        self.assertEqual(self.state["fb"], 1)
+
     def test_specs_updated(self):
         self.assertEqual(T.TASK_SPECS["first_buddy"]["kind"], "chat")
         self.assertEqual(T.TASK_SPECS["first_buddy"]["reward"], 300)
@@ -266,6 +274,35 @@ class GrowthPrereqTests(unittest.TestCase):
         finally:
             T._accounts.urlopen = orig
         self.assertEqual(tasks[0]["task_type"], "auto")
+
+    def test_valorant_uses_the_registered_expert(self):
+        """固定专家的任务必须用登记的真实 id，不能落回通用专家池。"""
+        events = []
+        state = {"completed": False}
+
+        def fetch(acc):
+            status = "completed" if state["completed"] else "accepted"
+            return [_task("WorkBuddy_Valorant", status=status,
+                          current=1 if state["completed"] else 0, target=1)]
+
+        def report(acc, evs, base=None):
+            events.extend(evs)
+            state["completed"] = True
+            return True
+
+        original = (T.fetch_growth_tasks, T.report_events, T.claim_task)
+        T.fetch_growth_tasks = fetch
+        T.report_events = report
+        T.claim_task = lambda acc, code: {"ok": True, "credit": 100}
+        try:
+            earned = T._progress_one(
+                FakeAccount(), _task("WorkBuddy_Valorant", status="accepted"), [], 0)
+        finally:
+            (T.fetch_growth_tasks, T.report_events, T.claim_task) = original
+
+        self.assertEqual(events[0]["id"], "ex_xQHHD1u5Jkua")
+        self.assertEqual(events[0]["name"], "无畏契约拼豆专家")
+        self.assertEqual(earned, 100)
 
 
 if __name__ == "__main__":

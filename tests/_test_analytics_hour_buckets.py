@@ -17,7 +17,8 @@
   * 覆盖不到就退回扫描：非整小时的起点、until 切在桶中间、小时被剪掉、
     days_floor 以下——一律退回，结果与改动前的逐行口径一致；
   * checkpoint：小时子表与 max_at 随状态落盘/加载，重启（含真·子进程）后
-    与冷折逐字节一致；旧格式的日桶（没有 at/hours）整体拒收 → 重折一次；
+    与冷折逐字节一致；旧格式的日桶（没有 at）整体拒收 → 重折一次；而旧天
+    被剪掉的小时表（hours 键缺席或为 null）**不算损坏**，状态照常采用（#26，采纳用例见 _test_usage_aggregate_cache.py）；
   * 降级：坏小时子表（形状/小时键/at/max_at）一律当作没有缓存，结果回到真值；
   * 保留：WB_USAGE_HOUR_KEEP_HOURS 决定小时子表的保留线，剪掉的天退回扫描；
   * 开关：WB_USAGE_DAY_BUCKETS=0 时与改动前逐字节一致（旧口径）。
@@ -600,7 +601,7 @@ check("逐行口径的计价次数 == 窗口内非中止行数（8）", calls_sc
 # 午夜窗口：小时层与日桶层给出同一份窗口半（两条对齐路径互相印证）。
 restart()
 by_hours = P._analytics_window_from_hours(None, TODAY0, None, pricing_on)
-by_days = P._analytics_window_from_days(None, TODAY_KEY, pricing_on)
+by_days = P._analytics_window_from_days(None, TODAY_KEY, None, pricing_on)
 check("午夜窗口：小时层与日桶层一致（逐字节）",
       canon(by_hours) == canon(by_days), first_diff(canon(by_days), canon(by_hours)))
 
@@ -616,16 +617,29 @@ _, calls = cost_calls(lambda: win(NOON30, None))
 got = canon(win(NOON30, None))
 check("非整点起点（12:30）：退回扫描、结果一致", got == ref, first_diff(ref, got))
 check("非整点起点：确实走了整段扫描（计数桩 > 0）", calls > 0, calls)
-# 4.2 until 切在桶中间（早于折过的最大 at）：退回扫描、结果一致。
+# 4.2 until 切进折过的数据里（早于折过的最大 at）：落小时格点、那一刻没有
+#     整秒行时由小时层按「at < until 的桶」回答（闭窗口）；不落格点（切在
+#     桶中间）时退回扫描。两种情形结果都必须与逐行口径一致。
 cache_env_off()
 restart()
 ref = canon(win(NOON1, NOON1 + 7200))
 cache_env_nowrite()
 restart()
 got = canon(win(NOON1, NOON1 + 7200))
-check("until 切在桶中间：退回扫描、结果一致", got == ref, first_diff(ref, got))
+check("until 切进数据（落小时格点）：结果与逐行口径一致",
+      got == ref, first_diff(ref, got))
+check("until 切进数据（落小时格点）：小时层按闭窗口回答（计数桩 == 0）",
+      cost_calls(lambda: win(NOON1, NOON1 + 7200))[1] == 0)
+cache_env_off()
+restart()
+ref_mid = canon(win(NOON1, NOON1 + 7200 + 1800))
+cache_env_nowrite()
+restart()
+got_mid = canon(win(NOON1, NOON1 + 7200 + 1800))
+check("until 切在桶中间（不落格点）：退回扫描、结果一致",
+      got_mid == ref_mid, first_diff(ref_mid, got_mid))
 check("until 切在桶中间：走的是现折小时桶那条冷路径（计数桩 > 0）",
-      cost_calls(lambda: win(NOON1, NOON1 + 7200))[1] > 0)
+      cost_calls(lambda: win(NOON1, NOON1 + 7200 + 1800))[1] > 0)
 # 4.3 小时子表被剪掉的天：该天的窗口退回扫描、结果一致。
 cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=10 ** 9, hours=1)
 restart()
@@ -719,7 +733,7 @@ check("新进程记录到了加载的 offset（含 analytics）",
       "analytics" in child_state, child_state)
 
 print()
-print("[7] 降级：坏小时子表/旧格式一律当作没有缓存，结果回到真值")
+print("[7] 降级：坏小时子表/旧格式一律当作没有缓存（另有用例钉旧天的小时表缺席不算损坏）")
 
 
 def poison(data, realm=None):
@@ -767,7 +781,9 @@ mutate(lambda d: an_entry(d).update({"max_at": "now"}), "max_at 不是数字")
 mutate(lambda d: an_entry(d).update({"max_at": True}), "max_at 写成 true")
 mutate(lambda d: newest_day(d).pop("at"), "日桶没有 at（旧格式）")
 mutate(lambda d: newest_day(d).update({"at": "midnight"}), "日桶的 at 不是数字")
-mutate(lambda d: newest_day(d).pop("hours"), "日桶没有 hours（旧格式）")
+# 注意：这里**没有**「日桶没有 hours」那条用例。剪枝线摘掉旧天的小时表是被认可的
+# 常态（#26），采纳覆盖钉在 _test_usage_aggregate_cache.py（标记落在 all-time
+# 的 maps 上，一定可见，不受夹具/时区影响）。
 mutate(lambda d: newest_day(d).update({"hours": []}), "hours 不是对象")
 mutate(lambda d: mutate_hour(d, lambda h, k: h.update({"x": {}})),
        "小时键不是数字")
@@ -936,7 +952,7 @@ if hasattr(time, "tzset"):
             lo2 = time.mktime((2026, 10, 25, 0, 0, 0, 0, 0, -1))
             key2 = time.strftime("%Y-%m-%d", time.localtime(lo2))
             by_hours = P._analytics_window_from_hours(None, lo2, None, pricing_on)
-            by_days = P._analytics_window_from_days(None, key2, pricing_on)
+            by_days = P._analytics_window_from_days(None, key2, None, pricing_on)
             check("夏令时切换日：小时层与日桶层一致（逐字节）",
                   by_hours is not None and by_days is not None
                   and canon(by_hours) == canon(by_days),

@@ -1,0 +1,168 @@
+/* 自定义下拉：原生 <select> 被自绘控件接管，但语义必须原样保留。
+ *
+ * 回归背景：原生 select 的弹出层由浏览器绘制，CSS 够不着，深色主题下是
+ * 直角白框 + 系统蓝高亮。这里把每个 select 包进 .cs-wrap，用触发器 + 自绘
+ * 面板替换视觉。风险不在"好不好看"，而在**增强过程本身会碰坏原生语义**：
+ *   - 把 select 移出原父节点、或 display:none，会让 value / 表单提交失效；
+ *   - 忘了同步 selectedIndex，面板高亮会和真实值脱节；
+ *   - 动态插入的 select（Key 编辑器按行生成）没被接管，会退回原生样式。
+ *
+ * 这里钉住四类契约：
+ *   1. 结构：CSS 定义齐全、JS 关键分支存在、原生 select 不被删除；
+ *   2. 渐进增强：CSS 默认不隐藏原生控件，只有 JS 加上 .cs-native 后才隐藏；
+ *   3. 交互：键盘（↑↓ / Enter / Esc）与 aria 角色齐备；
+ *   4. 动态接管：MutationObserver 覆盖后插入的 select。
+ *
+ * Run with Node: node tests/_test_custom_select.js
+ */
+'use strict';
+
+const assert = require('assert');
+const {dashboardHtml, dashboardScript} = require('./_dashboard_source.js');
+
+const html = dashboardHtml();
+const script = dashboardScript();
+
+let passed = 0;
+function ok(name, fn) {
+  fn();
+  passed += 1;
+  console.log('  ok ' + name);
+}
+
+/* ── 1. CSS 契约 ─────────────────────────────────────────────── */
+
+ok('CSS 定义了触发器 / 面板 / 选项 / 箭头', () => {
+  for (const cls of ['.cs-wrap', '.cs-trigger', '.cs-panel', '.cs-opt', '.cs-arrow', '.cs-value']) {
+    assert.ok(html.includes(cls + '{') || html.includes(cls + ' '), 'missing CSS rule ' + cls);
+  }
+});
+
+ok('CSS 用主题变量而不是硬编码颜色', () => {
+  const block = html.slice(html.indexOf('.cs-wrap{'), html.indexOf('[data-theme="dark"] select'));
+  assert.ok(block.length > 200, 'custom-select CSS block not found');
+  for (const v of ['var(--panel2)', 'var(--line)', 'var(--fg)', 'var(--accent)']) {
+    assert.ok(block.includes(v), 'CSS should use theme variable ' + v);
+  }
+  // 面板底色必须是主题色，不能写死白色
+  assert.ok(!/\.cs-panel\{[^}]*background:\s*#fff/i.test(block), 'panel must not hardcode #fff');
+});
+
+ok('原生控件只在 .cs-native 存在时才被视觉隐藏', () => {
+  const rule = html.match(/\.cs-native\{([^}]*)\}/);
+  assert.ok(rule, '.cs-native rule missing');
+  assert.ok(/opacity:\s*0/.test(rule[1]), 'native select must be opacity:0');
+  // 不能用 display:none / visibility:hidden，否则表单与无障碍失效
+  assert.ok(!/display:\s*none/.test(rule[1]), '.cs-native must not use display:none');
+  assert.ok(!/visibility:\s*hidden/.test(rule[1]), '.cs-native must not use visibility:hidden');
+});
+
+ok('默认（无 JS）不隐藏任何 select', () => {
+  // 只有 .cs-native 类隐藏；裸 select 没有任何 opacity/display 归零的规则
+  const bare = html.match(/(^|\})\s*select\s*\{([^}]*)\}/);
+  if (bare) {
+    assert.ok(!/opacity:\s*0/.test(bare[2]), 'bare select must stay visible without JS');
+    assert.ok(!/display:\s*none/.test(bare[2]), 'bare select must stay visible without JS');
+  }
+});
+
+ok('面板支持向上展开与滚动上限', () => {
+  assert.ok(html.includes('.cs-wrap.cs-drop-up'), 'missing drop-up rule');
+  const panel = html.match(/\.cs-panel\{([^}]*)\}/);
+  assert.ok(panel && /max-height:/.test(panel[1]), 'panel needs max-height');
+  assert.ok(panel && /overflow:auto/.test(panel[1]), 'panel needs overflow:auto');
+});
+
+ok('选中态与禁用态有独立样式', () => {
+  assert.ok(html.includes('.cs-opt.cs-selected'), 'missing selected style');
+  assert.ok(html.includes('.cs-opt.cs-disabled'), 'missing disabled style');
+});
+
+/* ── 2. JS 结构契约 ─────────────────────────────────────────── */
+
+ok('增强逻辑只包一次，重复注入不会双层包裹', () => {
+  assert.ok(script.includes('window.__csEnhanced'), 'missing idempotence guard');
+  assert.ok(script.includes("sel.dataset.csDone === '1'"), 'missing per-element guard');
+});
+
+ok('原生 select 被移动而非删除', () => {
+  const fn = script.slice(script.indexOf('function enhance(sel)'));
+  assert.ok(fn.includes('wrap.appendChild(sel)'), 'native select must be moved into the wrapper');
+  assert.ok(!/sel\.remove\(\)|removeChild\(sel\)/.test(fn), 'native select must never be removed');
+});
+
+ok('选中值变化会派发 change 事件', () => {
+  assert.ok(script.includes("new Event('change', { bubbles: true })"),
+    'picking an option must dispatch a bubbling change event');
+});
+
+ok('触发器与面板同步 selectedIndex', () => {
+  const fn = script.slice(script.indexOf('function syncLabel'));
+  assert.ok(fn.includes('sel.selectedIndex'), 'syncLabel must read selectedIndex');
+  assert.ok(fn.includes('cs-selected'), 'syncLabel must mark the selected row');
+});
+
+ok('面板按 options 逐项重建', () => {
+  const fn = script.slice(script.indexOf('function buildPanel'));
+  assert.ok(fn.includes('sel.options.length'), 'buildPanel must iterate sel.options');
+  assert.ok(fn.includes('disabled'), 'buildPanel must carry the disabled flag');
+});
+
+/* ── 3. 交互与无障碍 ───────────────────────────────────────── */
+
+ok('键盘：上下键 / Enter / Esc 都有处理', () => {
+  for (const key of ['ArrowDown', 'ArrowUp', 'Enter', 'Escape', 'Tab']) {
+    assert.ok(script.includes("'" + key + "'"), 'missing keyboard handling for ' + key);
+  }
+});
+
+ok('aria 角色：listbox / option / aria-selected / aria-expanded', () => {
+  for (const attr of ['aria-haspopup', 'aria-expanded', 'aria-selected', 'role']) {
+    assert.ok(script.includes(attr), 'missing ' + attr);
+  }
+  assert.ok(script.includes("'listbox'"), 'panel must declare role=listbox');
+  assert.ok(script.includes("'option'"), 'rows must declare role=option');
+});
+
+ok('点击外部关闭，Esc 全局关闭', () => {
+  assert.ok(script.includes("document.addEventListener('click'"), 'missing outside-click close');
+  assert.ok(script.includes("if (e.key === 'Escape' && openWrap)"), 'missing global Esc close');
+});
+
+ok('同时只允许一个面板打开', () => {
+  assert.ok(script.includes('function closeAll'), 'missing closeAll');
+  assert.ok(script.includes('closeAll(wrap)'), 'opening must close the previous panel');
+});
+
+ok('滚动只重定位、不关闭面板', () => {
+  // 曾经在这里写成 closeWrap，导致 scrollIntoView 之后刚打开就消失
+  const marker = "window.addEventListener('scroll', function(){";
+  const idx = script.lastIndexOf(marker);
+  assert.ok(idx > 0, 'missing scroll handler');
+  const body = script.slice(idx, idx + 200);
+  assert.ok(body.includes('positionPanel'), 'scroll should reposition');
+  assert.ok(!body.includes('closeWrap'), 'scroll must not close the panel');
+});
+
+/* ── 4. 动态接管 ───────────────────────────────────────────── */
+
+ok('MutationObserver 接管后插入的 select', () => {
+  const idx = script.lastIndexOf('function boot(){');
+  assert.ok(idx > 0, 'missing boot()');
+  const body = script.slice(idx, idx + 900);
+  assert.ok(body.includes('MutationObserver'), 'boot must observe later DOM insertions');
+  assert.ok(body.includes("n.tagName === 'SELECT'"), 'must enhance directly inserted selects');
+});
+
+ok('options 变化时重建面板', () => {
+  const idx = script.indexOf('/* 外部数据改了 options');
+  assert.ok(idx > 0, 'missing options MutationObserver');
+  const body = script.slice(idx, idx + 320);
+  assert.ok(body.includes('buildPanel'), 'options change must rebuild the panel');
+});
+
+ok('程序化改 value 也能同步显示', () => {
+  assert.ok(script.includes('HTMLSelectElement.prototype'), 'missing value setter hook');
+});
+
+console.log('\n  ' + passed + ' assertions passed (custom select)');

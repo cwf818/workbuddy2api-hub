@@ -65,10 +65,13 @@ try_py() {
 }
 
 # 1) runtime bundled next to the script (portable "green" builds)
+#    The shipped ZIP only carries a Windows python/ tree, so on macOS and
+#    Linux nothing here matches and we fall back to the system Python below.
+BUNDLED=""
 for cand in "$HERE/python/bin/python3" "$HERE/python/bin/python" \
             "$HERE/python3/bin/python3" "$HERE/python/python.exe"; do
   [ -n "$PYEXE" ] && break
-  try_py "$cand"
+  if try_py "$cand"; then BUNDLED="$cand"; fi
 done
 
 # 2) Python on PATH (macOS: /usr/bin/python3 or Homebrew python3)
@@ -97,6 +100,7 @@ if [ -z "$PYEXE" ]; then
 fi
 
 PYREAL="$("$PYEXE" -c 'import sys; print(sys.executable)' 2>/dev/null || echo "$PYEXE")"
+PYVER="$("$PYEXE" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo "?")"
 
 echo "==========================================================="
 echo "  WorkBuddy proxy"
@@ -104,7 +108,12 @@ echo
 echo "  API      : http://127.0.0.1:$PORT/v1"
 echo "  Dashboard: http://127.0.0.1:$PORT/"
 echo
-echo "  Python   : $PYREAL"
+echo "  Python   : $PYREAL ($PYVER)"
+if [ -z "$BUNDLED" ]; then
+  echo
+  echo "  note: this package ships no Python runtime for macOS / Linux,"
+  echo "        so the system Python above is used (3.9+ required)."
+fi
 echo
 echo "  Keep this window open. Closing it stops the server."
 echo "  Press Ctrl+C to stop."

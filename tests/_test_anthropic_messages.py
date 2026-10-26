@@ -107,6 +107,42 @@ check("tool_result maps to a tool message",
       and tool_msg.get("content") == "a.txt", tool_msg)
 
 print()
+print("[1b] tool_result keeps images structured")
+img_block = {"type": "image", "source": {"type": "base64",
+             "media_type": "image/png", "data": "bbb"}}
+mixed = P._anthropic_tool_result_content([
+    {"type": "text", "text": "screenshot read"}, img_block,
+    {"type": "document", "source": {"type": "text", "data": "doc"}},
+])
+check("mixed tool_result is a list", isinstance(mixed, list), mixed)
+check("text part kept", mixed[0] == {"type": "text", "text": "screenshot read"}, mixed)
+check("image part kept as image_url",
+      mixed[1] == {"type": "image_url", "image_url": {
+          "url": "data:image/png;base64,bbb"}}, mixed)
+check("document part becomes text",
+      mixed[2]["type"] == "text" and "doc" in mixed[2]["text"], mixed)
+check("pure text tool_result stays a string",
+      P._anthropic_tool_result_content("a.txt") == "a.txt")
+check("text error result is prefixed",
+      P._anthropic_tool_result_content("boom", True) == "error: boom")
+err_parts = P._anthropic_tool_result_content([img_block], True)
+check("image error result gets an error text part",
+      err_parts[0] == {"type": "text", "text": "error:"}, err_parts)
+
+req_img = {"model": "x", "messages": [
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "text", "text": "shot"}, img_block]}],
+    }]}
+chat_img = P.messages_to_chat(req_img)
+tool_img = [m for m in chat_img["messages"] if m.get("role") == "tool"][0]
+check("messages_to_chat keeps the image part",
+      isinstance(tool_img.get("content"), list)
+      and tool_img["content"][1]["type"] == "image_url", tool_img)
+
+print()
 print("[2] budget thinking maps to effort")
 check("disabled -> none", P.anthropic_effort_from_messages({"thinking": {"type": "disabled"}}) == "none")
 check("enabled low", P.anthropic_effort_from_messages({"thinking": {"type": "enabled", "budget_tokens": 1000}}) == "low")
@@ -131,14 +167,19 @@ chat_obj = {
 msg = P.chat_to_messages(chat_obj)
 check("id is a message id", msg["id"].startswith("msg_"), msg["id"])
 check("type/role are native", msg["type"] == "message" and msg["role"] == "assistant", msg)
-check("text block is present", msg["content"][0] == {"type": "text", "text": "hello"}, msg["content"])
+check("reasoning_content becomes a leading thinking block",
+      msg["content"][0] == {"type": "thinking", "thinking": "secret"}, msg["content"])
+check("text block is present", msg["content"][1] == {"type": "text", "text": "hello"}, msg["content"])
 check("tool_use block is present",
-      msg["content"][1]["type"] == "tool_use" and msg["content"][1]["input"] == {"cmd": "ls"}, msg["content"])
+      msg["content"][2]["type"] == "tool_use" and msg["content"][2]["input"] == {"cmd": "ls"}, msg["content"])
 check("stop_reason maps tool_calls -> tool_use", msg["stop_reason"] == "tool_use", msg["stop_reason"])
 check("usage maps cache fields",
-      msg["usage"] == {"input_tokens": 10, "output_tokens": 5,
+      msg["usage"] == {"input_tokens": 4, "output_tokens": 5,
                        "cache_read_input_tokens": 4, "cache_creation_input_tokens": 2}, msg["usage"])
-check("no unsigned thinking is replayed", "secret" not in json.dumps(msg, ensure_ascii=False), msg)
+check("no thinking block without reasoning_content",
+      all(b["type"] != "thinking" for b in
+          P.chat_to_messages({"choices": [{"message": {"content": "hi"}}]})["content"]),
+      P.chat_to_messages({"choices": [{"message": {"content": "hi"}}]})["content"])
 
 print()
 print("[4] streaming text event order")
@@ -187,6 +228,31 @@ err_events = parse_events(list(P.stream_messages_events(iter([
 check("error event is emitted", err_events and err_events[-1][0] == "error", err_events)
 check("error payload has a native type",
       err_events[-1][1]["error"]["type"] == "api_error" if err_events else False, err_events)
+
+print()
+print("[6b] streaming thinking events")
+think_chunks = [
+    b'data: {"id":"chatcmpl_4","model":"m","choices":[{"delta":{"reasoning_content":"hmm"}}]}\n\n',
+    b'data: {"id":"chatcmpl_4","model":"m","choices":[{"delta":{"reasoning_content":" ok"}}]}\n\n',
+    b'data: {"id":"chatcmpl_4","model":"m","choices":[{"delta":{"content":"42"}}]}\n\n',
+    b'data: {"id":"chatcmpl_4","model":"m","choices":[{"finish_reason":"stop","delta":{}}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\n',
+    b'data: [DONE]\n\n',
+]
+t_events = parse_events(list(P.stream_messages_events(iter(think_chunks), "m")))
+t_types = [e[0] for e in t_events]
+starts = [e[1] for e in t_events if e[0] == "content_block_start"]
+check("thinking block opens before the text block",
+      starts and starts[0]["content_block"]["type"] == "thinking"
+      and len(starts) > 1 and starts[1]["content_block"]["type"] == "text", starts)
+thinking = "".join(e[1]["delta"]["thinking"] for e in t_events
+                   if e[0] == "content_block_delta" and e[1]["delta"].get("type") == "thinking_delta")
+check("thinking deltas combine", thinking == "hmm ok", thinking)
+body_text = "".join(e[1]["delta"]["text"] for e in t_events
+                    if e[0] == "content_block_delta" and e[1]["delta"].get("type") == "text_delta")
+check("text deltas combine", body_text == "42", body_text)
+stop_idx = [e[1]["index"] for e in t_events if e[0] == "content_block_stop"]
+check("thinking block stops before the text block", stop_idx == [0, 1], stop_idx)
+check("stream ends with message_stop", t_types and t_types[-1] == "message_stop", t_types)
 
 print()
 print("[7] count_tokens uses the native response shape")

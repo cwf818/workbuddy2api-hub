@@ -162,6 +162,21 @@ def clear_daily():
     P._estimate_daily_cache["entry"] = ((P.ESTIMATE_DAILY_FILE, None, None), {})
 
 
+def clear_log():
+    """清掉 usage.jsonl（每个用例从空日志开始）。
+
+    整套用例共用一个 USAGE_LOG：write_log() 截断，append_log() 只追加。于是
+    「跨天归档」那条把行追加进了上一个用例留下的日志里，而留下的那些行用的是
+    **真实时钟**（含 429 行的重置时刻），它们的重置时刻会插进本用例的窗口、被
+    _cap_window_start 当成链式起点，样本从 820 被截成 120。真实部署只有一个
+    进程、一个日志，不存在「上一个用例」，所以这是测试隔离问题。
+    """
+    try:
+        os.unlink(P.USAGE_LOG)
+    except OSError:
+        pass
+
+
 def restart_fold():
     """Drop the in-memory fold the way a process restart would."""
     with P._remaining_state_lock:
@@ -217,6 +232,7 @@ class RemainingUsageTests(unittest.TestCase):
     def setUp(self):
         clear_events()
         clear_daily()
+        clear_log()
         restart_fold()
     def test_sample_is_the_24h_before_the_reset(self):
         reset, detail = reset_epoch("2026-10-10 15:18:17")
@@ -239,6 +255,11 @@ class RemainingUsageTests(unittest.TestCase):
         self.assertEqual(budget["realm"], "intl")
         self.assertEqual(budget["avg"], 3000)
         self.assertEqual(budget["n"], 1)
+        self.assertEqual(len(budget["samples_list"]), 1)
+        sample = budget["samples_list"][0]
+        self.assertEqual(sample["account"], "acct-A")
+        self.assertEqual(sample["sample"], 3000)
+        self.assertTrue(sample["at_iso"])
 
     def test_budget_averages_accounts_not_events(self):
         # 新口径（近 3 天加权）下这条同时钉两件事：同一天内一个账号的多个
@@ -906,9 +927,8 @@ class RemainingUsageTests(unittest.TestCase):
         self.assertTrue(find_row(data, "acct-A")["cooling"])
 
     def test_live_event_dedupes_against_the_log_row(self):
-        reset = time.time() + 30 * 60
-        _, detail = reset_epoch(time.strftime("%Y-%m-%d %H:%M:%S",
-                                              time.localtime(reset)))
+        reset = int(time.time()) + 30 * 60
+        detail = cap_detail(reset)
         write_log([
             usage_row(reset - 2 * HOUR, "acct-A", 900),
             # The 429 row the log keeps for this same cap (the last account of

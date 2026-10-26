@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
-"""上游连接复用池：按 (scheme, host, port, 代理串) 复用 http.client 的 keep-alive 连接。
+"""上游连接复用池：按 (scheme, host, port, 代理串, 凭据摘要) 复用 http.client 的
+keep-alive 连接。
+
+池键的最后一维是请求自带的账号凭据摘要（Authorization / X-Refresh-Token /
+X-User-Id 的 sha256 前 16 位）：同一个出口上的两个账号绝不共用一条 TCP/TLS
+连接。上游在一条连接上先后看到两个 Authorization 就是一条跨账号关联线索，
+项目口径是「每账号一台设备」（见 wb_fingerprint.py），连接层不能例外。同一
+账号的 chat / 计费 / 任务请求仍落在同一个键上，复用收益不变；没有凭据的请求
+（登录前、匿名探活）仍共用一个键，与改动前一致。
 
 为什么要自建池：CPython 的 urllib.request.AbstractHTTPHandler.do_open 会写死
 headers["Connection"] = "close"（它担心 addinfourl 读不干净持久连接），所以在
@@ -25,6 +33,7 @@ _KeepAlivePool._sweep_locked）：只回收被碰到过的那个键的话，一�
 的键（比如某个代理出口的账号被禁用）会把连接一直留到进程退出。
 """
 import base64
+import hashlib
 import http.client
 import io
 import os
@@ -78,6 +87,100 @@ def _idle_ttl():
         return max(5.0, float(os.environ.get("WB_UPSTREAM_POOL_IDLE") or "90"))
     except (TypeError, ValueError):
         return 90.0
+
+
+_SSL_CONTEXT = None
+_SSL_CONTEXT_KEY = None
+_SSL_CONTEXT_LOCK = threading.Lock()
+
+
+def ca_bundle_path():
+    """Optional PEM bundle for a private or self-signed TLS chain.
+
+    WB_CA_BUNDLE wins over SSL_CERT_FILE. Both are read on every call, so a
+    file that appears after startup is picked up without a restart. A path that
+    was explicitly set but does not exist is a configuration error, not a
+    silent fallback: otherwise every request keeps failing with the same
+    opaque certificate message and the user never learns which file is wrong.
+    """
+    for name in ("WB_CA_BUNDLE", "SSL_CERT_FILE"):
+        raw = os.environ.get(name)
+        if not raw or not str(raw).strip():
+            continue
+        path = os.path.abspath(os.path.expanduser(str(raw).strip()))
+        if os.path.isfile(path):
+            return path
+        if name == "WB_CA_BUNDLE":
+            raise RuntimeError("%s points to a missing file: %s" % (name, path))
+        # OpenSSL silently ignores a missing SSL_CERT_FILE; keep that behaviour
+        # instead of turning an OS-level leftover into a startup failure.
+    return ""
+
+
+# The pooled path builds its own context, but urllib is still used for
+# non-HTTP proxies and redirects. Exporting the bundle through the variable
+# OpenSSL already understands keeps those fallbacks on the same trust set.
+if os.environ.get("WB_CA_BUNDLE"):
+    _ca = ca_bundle_path()
+    if _ca:
+        os.environ["SSL_CERT_FILE"] = _ca
+
+
+def _resolve_ssl_factory():
+    """(标识, 构造器)：http.client 在 context=None 时实际会走的那条路。
+
+    3.13 起是 http.client._create_https_context(check_hostname)，之前直接是
+    ssl._create_default_https_context()。取这条接缝而不是直接调
+    ssl.create_default_context()，是为了让「谁都能换掉默认 context」继续有效
+    ——测试就是靠它把自签证书塞进 https 主路径的。
+
+    标识是底层那个函数对象本身：它变了就说明默认 context 被换过，缓存要作废。
+    """
+    factory = getattr(http.client, "_create_https_context", None)
+    if factory is not None:
+        # check_hostname=None 与 HTTPSConnection 自己的取法一致（不覆盖
+        # _create_default_https_context 给出的默认值）。
+        return factory, (lambda: factory(None))
+    factory = getattr(ssl, "_create_default_https_context", None)
+    if factory is not None:
+        return factory, factory
+    return ssl.create_default_context, ssl.create_default_context
+
+
+def shared_ssl_context():
+    """进程级共享的出站 TLS context（懒建，只建一次）。
+
+    http.client 在 context=None 时**每建一条连接就调一次**
+    ssl._create_default_https_context()。真机实测 create_default_context()
+    单次 20.4ms（要解析 121 张 CA 证书），而 45 个账号各走自己的代理就是 45 个
+    池键，连接来回过期重连时这笔开销按次付。更要紧的是 OpenSSL 的客户端会话
+    缓存挂在 SSLContext 上：每换一个新 context 就等于放弃 TLS session
+    resumption，每次握手都退化成完整握手。
+
+    一份进程级 context 同时省掉这两笔。校验设置完全由 stdlib 那条工厂决定
+    （默认 check_hostname=True、verify_mode=CERT_REQUIRED、走系统 CA 库），
+    **不放松任何校验**；工厂被换掉时缓存自动作废，所以那条接缝仍然有效。
+
+    懒建而不是导入时建：测试与只跑面板的进程根本不出站，不该为它们白付 20ms。
+    """
+    global _SSL_CONTEXT, _SSL_CONTEXT_KEY
+    ident, build = _resolve_ssl_factory()
+    key = (ident, ca_bundle_path())
+    if _SSL_CONTEXT is None or _SSL_CONTEXT_KEY != key:
+        with _SSL_CONTEXT_LOCK:
+            ident, build = _resolve_ssl_factory()
+            key = (ident, ca_bundle_path())
+            if _SSL_CONTEXT is None or _SSL_CONTEXT_KEY != key:
+                if key[1]:
+                    # Keep the system roots and add the private bundle on top:
+                    # a gateway that talks to both a normal CDN and a local
+                    # TLS-inspecting proxy must not lose either trust set.
+                    _SSL_CONTEXT = ssl.create_default_context()
+                    _SSL_CONTEXT.load_verify_locations(cafile=key[1])
+                else:
+                    _SSL_CONTEXT = build()
+                _SSL_CONTEXT_KEY = key
+    return _SSL_CONTEXT
 
 
 class PoolBypass(Exception):
@@ -455,8 +558,9 @@ def _proxy_bypassed(host):
 def _new_connection(scheme, host, port, proxy_info, timeout):
     """新建一条连接对象（不连接，惰性连接交给 http.client 自己）。
 
-    - 直连：HTTPS 目标用 HTTPSConnection（context 由 http.client 的默认
-      _create_https_context 建，与 urllib HTTPSHandler 完全同一套校验设置）；
+    - 直连：HTTPS 目标用 HTTPSConnection（context 走进程级共享的
+      shared_ssl_context()，校验设置与 http.client 的默认 _create_https_context
+      逐项一致，只是不再每次建连重建一份）；
     - 经 HTTP 代理：连的是代理的地址；HTTPS 目标走 CONNECT 隧道（set_tunnel），
       HTTP 目标直接把绝对 URL 当请求目标发给代理。
     """
@@ -466,7 +570,8 @@ def _new_connection(scheme, host, port, proxy_info, timeout):
         proxy_port = int(proxy_info["port"]) if proxy_info["port"] else (
             443 if scheme == "https" else 80)
         if scheme == "https":
-            conn = _PooledHTTPSConnection(proxy_info["host"], proxy_port, timeout=timeout)
+            conn = _PooledHTTPSConnection(proxy_info["host"], proxy_port, timeout=timeout,
+                                          context=shared_ssl_context())
             tunnel_headers = {}
             auth = _proxy_auth_header(proxy_info)
             if auth:
@@ -476,7 +581,8 @@ def _new_connection(scheme, host, port, proxy_info, timeout):
             return conn
         return _PooledHTTPConnection(proxy_info["host"], proxy_port, timeout=timeout)
     if scheme == "https":
-        return _PooledHTTPSConnection(host, port, timeout=timeout)
+        return _PooledHTTPSConnection(host, port, timeout=timeout,
+                                      context=shared_ssl_context())
     return _PooledHTTPConnection(host, port, timeout=timeout)
 
 
@@ -488,40 +594,106 @@ def _host_header_value(url):
     return netloc
 
 
-def _request_headers(req, scheme, proxy_info):
-    """按 urllib AbstractHTTPHandler.do_open 的规则拼请求头。
+#: 池键里用来区分「同一出口上的不同账号/凭据」的请求头，按优先级取第一个有值的。
+#: 取凭据的哈希而不是 uid：调用点不必改动，凡是带凭据的请求都自动隔离；只把
+#: sha256 前 16 位放进键里，token 本身不进日志、也不在池里多存一份。
+_IDENTITY_HEADER_FIELDS = ("authorization", "x-refresh-token", "x-user-id")
 
-    唯一的差别是 Connection: keep-alive（do_open 写死 close，那正是连接没法复用
-    的原因）。头名与**顺序**都按 do_open 的方式排：unredirected 侧先（自动
-    Content-type、Host、默认 User-agent——Content-Length 由 http.client 自动补在
-    最前，恰好就是 urllib 里它的位置），再是调用方给的头，最后 Connection。
-    这样线上字节与改动前逐字节相同（除了 Connection 的值），上游若对头顺序有
-    讲究也不会踩到。
+
+def _header_lookup(pairs):
+    """把 (name, value) 序列收成「小写头名 -> 第一个值」的字典。"""
+    lookup = {}
+    for name, value in pairs:
+        key = str(name).strip().lower()
+        if key not in lookup and value:
+            lookup[key] = value
+    return lookup
+
+
+def _identity_discriminator(req, ordered_headers=None):
+    """这条请求属于哪个账号/凭据：池键的最后一维（没有凭据时返回空串）。
+
+    两个账号落在同一个 (scheme, host, port, proxy) 上时，此前会复用同一条
+    TCP/TLS 连接，上游能在一条连接上先后看到两个 Authorization / X-User-Id。
+    把凭据摘要并进池键后各用各的连接；同一账号的不同请求仍共用一个键。
+    """
+    pairs = ordered_headers
+    if pairs is None:
+        pairs = list(req.headers.items())
+    lookup = _header_lookup(pairs)
+    for field in _IDENTITY_HEADER_FIELDS:
+        value = lookup.get(field)
+        if value:
+            digest = hashlib.sha256(
+                ("%s\0%s" % (field, value)).encode("utf-8")).hexdigest()[:16]
+            return "%s:%s" % (field, digest)
+    return ""
+
+
+def _exact_header_pairs(headers):
+    """把调用方给的有序头归一成 [(name, value), ...]；None 表示走默认路径。"""
+    if headers is None:
+        return None
+    if hasattr(headers, "items"):
+        return list(headers.items())
+    return list(headers)
+
+
+def _request_headers(req, scheme, proxy_info, ordered_headers=None):
+    """拼这一条请求的线上头。
+
+    默认路径（ordered_headers 为 None）按 urllib AbstractHTTPHandler.do_open 的
+    规则拼：unredirected 侧先（自动 Content-type、Host、默认 User-agent——
+    Content-Length 由 http.client 自动补在最前，恰好就是 urllib 里它的位置），
+    再是调用方给的头，最后 Connection。头名统一 .title()，线上字节与改动前
+    逐字节相同（除了 Connection 的值）。
+
+    保真路径（ordered_headers 非 None）只给显式要求「头名原样」的调用点用
+    （chat 路径，见 wb_proxy.open_upstream 与 wb_accounts._daily_chat_upstream）：
+    调用方给的是有序 (name, value)，头名**不做 .title()**，http.client 按原样
+    写到线上。为什么需要单独一条路：urllib.request.Request.add_header 会先把
+    头名 capitalize（X-Request-ID → X-request-id），所以只从 Request.headers
+    取值永远拿不回原名；保真调用点把有序头挂在 req.wb_exact_headers 上（见
+    urlopen 的 headers 参数），池这边直接用。billing / 登录 / 签到等路径不传，
+    行为完全不变。
     """
     headers = dict(req.unredirected_hdrs)
     data = req.data
+    ordered_names = None
+    if ordered_headers is not None:
+        ordered_names = {str(name).strip().lower() for name, _value in ordered_headers}
     if data is not None:
         # do_request_ 的默认：带 body 而没有 Content-type 时补表单类型
-        if not req.has_header("Content-type"):
+        if not req.has_header("Content-type") and not (
+                ordered_names is not None and "content-type" in ordered_names):
             headers["Content-type"] = "application/x-www-form-urlencoded"
         # Content-Length 不在这里补：http.client 的 _send_request 会按 body 自动补，
         # 位置与 urllib 的 unredirected 一侧相同，线上的字节完全一样。
-    if not req.has_header("Host"):
+    if not req.has_header("Host") and not (
+            ordered_names is not None and "host" in ordered_names):
         headers["Host"] = _host_header_value(req.full_url)
-    if not req.has_header("User-agent"):
+    if not req.has_header("User-agent") and not (
+            ordered_names is not None and "user-agent" in ordered_names):
         # 进程默认 opener 的兜底 UA；所有调用点都显式给了 UA，这里只保证不出现差异。
         headers["User-agent"] = "Python-urllib/%s" % urllib.request.__version__
-    headers.update(req.headers)
+    if ordered_headers is None:
+        headers.update(req.headers)
+    else:
+        for name, value in ordered_headers:
+            headers[name] = value
     if proxy_info and scheme == "http":
         # HTTP 目标经代理：认证头随请求发给代理（HTTPS 目标的认证头在 CONNECT 里）
         auth = _proxy_auth_header(proxy_info)
         if auth:
             headers["Proxy-authorization"] = auth
     headers["Connection"] = "keep-alive"
+    if ordered_headers is not None:
+        return headers
     return {name.title(): value for name, value in headers.items()}
 
 
-def _exchange(conn, req, selector, scheme, proxy_info, key, reused):
+def _exchange(conn, req, selector, scheme, proxy_info, key, reused,
+              ordered_headers=None):
     """在 conn 上完成一次请求/响应交换，返回挂好归还语义的响应对象。
 
     失败时抛：
@@ -530,7 +702,7 @@ def _exchange(conn, req, selector, scheme, proxy_info, key, reused):
       - 其他异常：连接不可信，调用方丢弃后原样上抛
     """
     method = req.get_method()
-    headers = _request_headers(req, scheme, proxy_info)
+    headers = _request_headers(req, scheme, proxy_info, ordered_headers)
     try:
         conn.request(method, selector, req.data, headers,
                      encode_chunked=req.has_header("Transfer-encoding"))
@@ -592,8 +764,18 @@ def egress_key(url, proxy=""):
         pass
     return (scheme, host, port, proxy_raw)
 
-def urlopen(req, timeout=30, proxy=""):
-    """连接池版 urlopen。签名与 wb_accounts.urlopen 一致。
+def urlopen(req, timeout=30, proxy="", headers=None):
+    """连接池版 urlopen。默认签名与 wb_accounts.urlopen 一致，多了 headers。
+
+    headers：可选的有序 (name, value) 序列（或 dict）。给了就按原样发这些头名
+    （不做 .title()），用于 chat 这类必须与官方客户端逐字节对齐的路径；不给时
+    沿用 req.headers 与 .title() 的默认路径，billing / 登录 / 签到等行为不变。
+    保真路径也可以由调用方把有序头挂在 req.wb_exact_headers 上（wb_proxy 的
+    chat 路径就是这么做，省得改 wb_accounts.urlopen 的签名与所有测试替身）。
+
+    池键 = (scheme, host, port, 代理串, 凭据摘要)：不同账号绝不共用同一条
+    TCP/TLS 连接；同一账号仍按出口复用。凭据摘要由 _identity_discriminator
+    从 Authorization / X-Refresh-Token / X-User-Id 现取（sha256 前 16 位）。
 
     失败语义与 urllib 对齐：HTTP >= 400 抛 HTTPError（body 已读好，挂在 BytesIO
     上，exc.read()/read(n)/fp 的行为不变）；发送阶段的 OSError 抛 URLError；
@@ -612,9 +794,13 @@ def urlopen(req, timeout=30, proxy=""):
     if proxy_info and scheme == "http":
         # 经代理的 HTTP 请求：请求目标是绝对 URL（urllib set_proxy 同款）
         selector = req.full_url
-    # 池键按（目标, 代理串）分：不同出口的账号绝不共用一条连接，即使代理地址
-    # 相同、只是串写法不同（宁可多一条连接，也不赌两个出口是同一个）。
-    key = (scheme, host, port, proxy_raw)
+    ordered_headers = _exact_header_pairs(
+        headers if headers is not None else getattr(req, "wb_exact_headers", None))
+    # 池键按（目标, 代理串, 凭据）分：不同出口的账号绝不共用一条连接，即使代理
+    # 地址相同、只是串写法不同（宁可多一条连接，也不赌两个出口是同一个）；同一
+    # 出口上的不同账号也绝不共用（凭据摘要不同），见模块 docstring。
+    key = (scheme, host, port, proxy_raw,
+           _identity_discriminator(req, ordered_headers))
 
     def factory():
         return _new_connection(scheme, host, port, proxy_info, timeout)
@@ -626,7 +812,8 @@ def urlopen(req, timeout=30, proxy=""):
     retried = False
     while True:
         try:
-            resp = _exchange(conn, req, selector, scheme, proxy_info, key, reused)
+            resp = _exchange(conn, req, selector, scheme, proxy_info, key, reused,
+                             ordered_headers)
         except _StaleConnection as stale:
             _POOL.discard(conn)
             if reused and replayable and not retried:

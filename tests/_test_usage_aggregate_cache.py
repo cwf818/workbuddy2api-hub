@@ -20,6 +20,8 @@ v4 起一类状态一份文件（usage-aggregate-cache-<kind>.json）：这一�
   * 降级：损坏 JSON / 截断 / schema 不符 / 日志被替换、截断或同尺寸重写 /
     tail 签名不符 / 位置或类型不合法 / 目录不可写，一律当作没有缓存、走
     全量，结果正确且不抛错；
+  * 采纳：剪枝线摘掉旧天的小时表（小时层比日桶短命）不算损坏，analytics
+    状态照常采用——误拒就会天天全量重折（#26）；
   * 指纹：价格表或 realm 归属一变，checkpoint 必须作废；
   * 节流：默认阈值下连续刷新不写文件，推进到阈值才写；
   * 开关：WB_USAGE_CACHE=0 时行为与 #189 原状一致（不读也不写）。
@@ -470,8 +472,8 @@ check("每个写出的 kind 文件都是 schema=当前版本、kind 标签正确
           for k in P._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])),
       {k: (kind_file_data(k).get("schema"), kind_file_data(k).get("kind"))
        for k in P._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])})
-check("schema 版本是 v4（一类一份的布局）",
-      P._USAGE_CACHE_SCHEMA == 4, P._USAGE_CACHE_SCHEMA)
+check("schema 版本是 v5（一类一份的布局 + 「用到的价」指纹）",
+      P._USAGE_CACHE_SCHEMA == 5, P._USAGE_CACHE_SCHEMA)
 check("三份状态都写进去了（每个 realm 一份）",
       len(stored["snapshot"]) == 3 and len(stored["by_account"]) == 1
       and len(stored["analytics"]) == 3,
@@ -662,8 +664,10 @@ restart()
 check("文件不存在：结果回到真值", canon(live()) == GOLDEN)
 
 # 4.2 schema 与顶层形状（按类分别校验：坏一份只作废一份）
-mutate_kind_file("snapshot", lambda d: d.update({"schema": 5}),
+mutate_kind_file("snapshot", lambda d: d.update({"schema": 6}),
                  "schema 版本不符（比当前新）")
+mutate_kind_file("snapshot", lambda d: d.update({"schema": 4}),
+                 "旧 schema（v4 的价格指纹是旧形状，条目结构相同也不放行）")
 mutate_kind_file("snapshot", lambda d: d.update({"schema": 3}),
                  "旧 schema（v3 单文件布局，条目结构相同也不放行）")
 mutate_kind_file("snapshot", lambda d: d.update({"schema": 2}),
@@ -671,7 +675,7 @@ mutate_kind_file("snapshot", lambda d: d.update({"schema": 2}),
 mutate_kind_file("snapshot", lambda d: d.update({"schema": True}),
                  "schema 写成 true（Python 里 True == 1）")
 mutate_kind_file("snapshot", lambda d: d.pop("schema"), "schema 缺失")
-mutate_kind_file("snapshot", lambda d: d.update({"schema": "4"}),
+mutate_kind_file("snapshot", lambda d: d.update({"schema": "5"}),
                  "schema 写成字符串")
 mutate_kind_file("snapshot", lambda d: d.update({"kind": "analytics"}),
                  "kind 标签与文件名不符")
@@ -743,19 +747,91 @@ mutate_cache(lambda d: _entry(d, "snapshot", None).pop("realm"),
 mutate_cache(lambda d: _entry(d, "snapshot", None).update({"realm": 5}),
              "realm 字段类型不对")
 
-# 4.6 指纹
+# 4.6 采纳：剪枝线摘掉旧天的小时表不算损坏（#26）
+#
+# _prune_day_buckets 的 hours_keep 一段会把保留窗口之外的旧天的小时表摘掉
+# （pop 掉键；午夜兜底那天则置 None）。摘掉之后这份状态仍然可用：按日对齐的
+# 窗口照旧由日桶自身的 maps 回答，整点窗口本来就按 hours is None 退回整段
+# 扫描。曾经 analytics 的日桶判据要求 hours 必须是 dict，于是「只要还在折新行，
+# 剪枝线天天摘、整份状态天天被判废」，每次进程启动都要付一次全量重折（44MB
+# 副本上实测 ~3s）。下面反过来钉：这样的状态**必须被采纳**。
+
+
+def strip_day_hours(entry, mode="pop"):
+    """模拟剪枝线：把日桶的 hours 子表摘掉。返回摘掉的天数。"""
+    days = entry.get("days") or {}
+    stripped = 0
+    for bucket in days.values():
+        if not isinstance(bucket, dict) or "hours" not in bucket:
+            continue
+        if mode == "pop":
+            bucket.pop("hours", None)
+        else:
+            bucket["hours"] = None
+        stripped += 1
+    return stripped
+
+
+def accept_cache(mutate, label, kind="analytics", realm=None):
+    """加标记 + 变异后加载——标记必须仍出现在结果里（= 状态被采纳）。
+
+    与 mutate_cache 相反：那边钉「坏状态必须被拒」，这边钉「合法状态不许被
+    误拒」。被误拒时走全量重折，标记消失、结果等于真值，用例当场失败。
+
+    每轮先清掉盘上的 checkpoint 从干净的一份重来：与降级用例不同，这里标记
+    会被真的采用，采用后的状态可能落回盘上，不清就会把 +1000 带进后面的用例。
+    """
+    clear_cache_files()
+    make_checkpoint()
+    data = cache_data()
+    poison(data, kind, realm)
+    mutate(data)
+    save_cache(data)
+    cache_env_nowrite()
+    restart()
+    got, err = live_canon()
+    check(label, got is not None and got != GOLDEN,
+          err or "状态被误拒（标记没出现，说明整份重折了）")
+
+
+_state = {}
+accept_cache(lambda d: _state.update(
+    n=strip_day_hours(_entry(d, "analytics", None))),
+    "旧天没有 hours 键的 analytics 状态仍被采纳（#26）")
+check("用例有实义：确实摘掉了至少一个日桶的 hours 键",
+      _state.get("n", 0) > 0, "夹具里没有带 hours 的日桶")
+
+_state = {}
+accept_cache(lambda d: _state.update(
+    n=strip_day_hours(_entry(d, "analytics", None), "none")),
+    "旧天的 hours 为 null 的 analytics 状态仍被采纳（#26）")
+check("用例有实义：确实把至少一个日桶的 hours 置成了 null",
+      _state.get("n", 0) > 0, "夹具里没有带 hours 的日桶")
+
+# 收尾：把带标记的状态从盘上清掉、重建一份干净的 checkpoint，免得 +1000
+# 顺着盘上的文件漏进后面的指纹用例。
+clear_cache_files()
+make_checkpoint()
+
+# 4.7 指纹
 mutate_cache(lambda d: _entry(d, "snapshot").update({"pricing": ["on", "x", "y", "z"]}),
-             "价格指纹被改")
+             "价格指纹被改（旧形状的列表）")
 mutate_cache(lambda d: _entry(d, "snapshot").update({"pricing": None}),
              "价格指纹缺失")
+mutate_cache(lambda d: _entry(d, "snapshot")["pricing"].update({"builtin": "0" * 40}),
+             "用到的价：内置价目表摘要被改")
+mutate_cache(lambda d: _entry(d, "snapshot")["pricing"].update({"timeline_models": []}),
+             "用到的价：时间线依赖被抹掉（投影摘要对不上）")
 mutate_cache(lambda d: _entry(d, "snapshot").update({"realm_inputs": ["cn", []]}),
              "realm 指纹被改")
 mutate_cache(lambda d: _entry(d, "analytics").update({"pricing": ["off"]}),
              "analytics 的价格指纹被改", kind="analytics")
+mutate_cache(lambda d: _entry(d, "analytics")["pricing"].update({"refs": {"ghost": "0" * 40}}),
+             "analytics 的用到的价：多出一个查不到的 pid", kind="analytics")
 mutate_cache(lambda d: _entry(d, "analytics").update({"realm_inputs": ["cn", []]}),
              "analytics 的 realm 指纹被改", kind="analytics")
 
-# 4.7 真实变化：价格表 / realm 归属
+# 4.8 真实变化：价格表 / realm 归属
 make_checkpoint()
 write_pricing({**PRICING, "meta": {"usd_cny": 7.4}, "models": {
     **PRICING["models"],
@@ -952,38 +1028,53 @@ check("写出来的还是完整的 checkpoint（每份自带 schema 与 kind 标
 # 空闲不重写（本节的靶子）：进度已对齐到 checkpoint，等满一个时间窗口后再
 # 刷新，日志没有新字节 → 不许再写。旧行为：计时器到点就无条件写一份逐字节
 # 相同的 checkpoint，面板开着等于每 900s 白写一份 120KB（纯写放大）。
-cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=900)
-before = os.stat(KIND_FILES["snapshot"]).st_mtime_ns
-P._usage_cache_last_attempt -= 901
-live()
-check("计时器到点 + 无推进：不写（空闲不重写）",
-      os.stat(KIND_FILES["snapshot"]).st_mtime_ns == before)
-# 同一件事从真实调用路径再走一遍：无新字节的 usage_snapshot(range="today")
-# 是面板轮询每几秒就碰一次的路径（日桶半 → _usage_cache_maybe_save）。
-P._usage_cache_last_attempt -= 901
-P.usage_snapshot(range="today", ttl=0)
-check("无新字节的 usage_snapshot(range=today) 不重写 checkpoint",
-      os.stat(KIND_FILES["snapshot"]).st_mtime_ns == before)
-# 有推进（不足字节阈值）：计时器分支照常写——修的是空闲重写，不是计时器
-append_log([row(FROZEN - 100, "m-a", "u1", 500, 50)])
-P._usage_cache_last_attempt -= 901
-live()
-check("计时器到点 + 有新字节（不足字节阈值）：写一次",
-      os.stat(KIND_FILES["snapshot"]).st_mtime_ns != before)
-write_log(ROWS)                          # 恢复基线日志，后续用例共用它
+#
+# 判据用写盘调用计数，不用文件时间或内容：exFAT 的 mtime 粒度粗，
+# 而一份内容相同的重写与「没有写」在文件上也看不出区别。
+snapshot_writes = []
+real_write_kind = P._usage_cache_write_kind
 
-# 加载之后不产生「白写」：采用 checkpoint 会把节流基线对齐到加载的 offset
-cache_env(enabled=1)                     # 默认阈值
-before = os.stat(KIND_FILES["snapshot"]).st_mtime_ns
-restart()
-live()
-check("重启加载后（默认阈值）不会重写一份内容相同的文件",
-      os.stat(KIND_FILES["snapshot"]).st_mtime_ns == before)
-cache_env_off()
-clear_cache_files()
-restart()
-live()
-check("开关关闭 + 阈值全 0：仍然不写", no_cache_files())
+
+def counting_write_kind(kind, entries):
+    if kind == "snapshot":
+        snapshot_writes.append(entries)
+    return real_write_kind(kind, entries)
+
+
+P._usage_cache_write_kind = counting_write_kind
+try:
+    cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=900)
+    P._usage_cache_last_attempt -= 901
+    live()
+    check("计时器到点 + 无推进：不写（空闲不重写）", snapshot_writes == [])
+    # 同一件事从真实调用路径再走一遍：无新字节的 usage_snapshot(range="today")
+    # 是面板轮询每几秒就碰一次的路径（日桶半 → _usage_cache_maybe_save）。
+    P._usage_cache_last_attempt -= 901
+    P.usage_snapshot(range="today", ttl=0)
+    check("无新字节的 usage_snapshot(range=today) 不重写 checkpoint",
+          snapshot_writes == [])
+    # 有推进（不足字节阈值）：计时器分支照常写——修的是空闲重写，不是计时器
+    append_log([row(FROZEN - 100, "m-a", "u1", 500, 50)])
+    P._usage_cache_last_attempt -= 901
+    live()
+    check("计时器到点 + 有新字节（不足字节阈值）：写一次",
+          len(snapshot_writes) == 1)
+    write_log(ROWS)                          # 恢复基线日志，后续用例共用它
+
+    # 加载之后不产生「白写」：采用 checkpoint 会把节流基线对齐到加载的 offset
+    cache_env(enabled=1)                     # 默认阈值
+    snapshot_writes.clear()
+    restart()
+    live()
+    check("重启加载后（默认阈值）不会重写一份内容相同的文件",
+          snapshot_writes == [])
+    cache_env_off()
+    clear_cache_files()
+    restart()
+    live()
+    check("开关关闭 + 阈值全 0：仍然不写", no_cache_files())
+finally:
+    P._usage_cache_write_kind = real_write_kind
 
 print()
 print("[8] 幂等：同一份 checkpoint 只被采用一次")

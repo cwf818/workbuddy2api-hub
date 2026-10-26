@@ -113,4 +113,24 @@ check('a value without the x prefix is shown in the same format',
 cell = creditsCell({id: 'hy3', credits: 'X1.33'});
 check('an upper-case prefix is normalized too', cell.includes('1.33x'), cell);
 
+// 6. #505/#527: the entitlement label rides next to the multiplier, and the
+//    cell opts into wrapping so the second pill is not clipped. The label is
+//    one-way: only blocked models carry it, and its tooltip says where the
+//    claim came from (catalogue tier map vs a recorded upstream 11158).
+window.VIEW_REALM = 'intl';
+cell = creditsCell({id: 'gpt-6-astra', credits: 'x6.67',
+                    entitlement: {source: 'catalog', required: 'standard', at: 1}});
+check('the catalogue tier label is rendered', cell.includes('Pro Only'), cell);
+check('the multiplier is still rendered', cell.includes('6.67x'), cell);
+check('the cell allows wrapping', /class="rate-cell"/.test(tbody.innerHTML),
+      tbody.innerHTML);
+check('the catalogue tooltip names its source', cell.includes('上游目录声明'), cell);
+cell = creditsCell({id: 'gpt-6-astra', credits: 'x6.67',
+                    entitlement: {source: 'runtime', code: 11158,
+                                  userType: 'personal_free_user', checked_at: 1}});
+check('a runtime mark is still labelled', cell.includes('Pro Only'), cell);
+check('the runtime tooltip carries the upstream code', cell.includes('11158'), cell);
+cell = creditsCell({id: 'gpt-6-astra', credits: 'x6.67'});
+check('no entitlement means no label', !cell.includes('Pro Only'), cell);
+
 console.log('model credits assertions passed (' + checks + ' checks)');

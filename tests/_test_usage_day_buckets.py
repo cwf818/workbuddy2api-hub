@@ -520,17 +520,18 @@ for name in ("today", "week", "month"):
     check("窗口 %s：日桶路径 == 逐行口径（整包逐字节）" % name, ref == got,
           first_diff(ref, got))
 # 日桶状态不可用时现折的那份（_scan_*_window_days）也必须与有日桶时一致：
-# 清掉状态后先只调一次窗口，再把结果与有日桶时的窗口比。
+# 清掉状态后先折出一份 all-time（窗口请求本身不折——冷状态直接走扫描，
+# 见 T14 的 _usage_snap_state_cold），再把结果与有日桶时的窗口比。
 lo = window_start("week")
 day_key = time.strftime("%Y-%m-%d", time.localtime(lo))
 cache_env_nowrite()
 restart()
-P._usage_snapshot_uncached(since=lo, until=None)
+P._usage_snapshot_uncached()
 from_state = P._empty_stats()
 for k in sorted(P._usage_snap_state[None]["days"]):
     if k >= day_key:
         P._add_usage_snapshot(from_state, P._usage_snap_state[None]["days"][k])
-COLD_SNAP = P._scan_usage_snapshot_window_days(None, lo)
+COLD_SNAP = P._scan_usage_snapshot_window_days(None, lo, None)
 check("冷路径（现折日桶）的 snapshot == 有日桶时相加的结果",
       canon(COLD_SNAP) == canon(from_state),
       first_diff(canon(from_state), canon(COLD_SNAP)))
@@ -542,9 +543,9 @@ for k in sorted(P._analytics_state[None]["days"]):
     if k >= day_key:
         P._add_analytics_window_maps(from_state, P._analytics_state[None]["days"][k])
 check("冷路径（现折日桶）的 analytics 窗口半 == 有日桶时相加的结果",
-      canon(P._scan_usage_analytics_window_days(None, lo)) == canon(from_state),
+      canon(P._scan_usage_analytics_window_days(None, lo, None)) == canon(from_state),
       first_diff(canon(from_state),
-                 canon(P._scan_usage_analytics_window_days(None, lo))))
+                 canon(P._scan_usage_analytics_window_days(None, lo, None))))
 
 print()
 print("[3] 封口：越过的那天不再重折（对象原样复用），只有今天在长")
@@ -576,9 +577,9 @@ print()
 print("[4] checkpoint：日桶随状态落盘/加载，重启后逐字节一致")
 check("写盘成功", make_checkpoint())
 stored = cache_data()
-check("每个 kind 文件都是 schema=当前版本（v4）的 JSON 对象",
+check("每个 kind 文件都是 schema=当前版本（v5）的 JSON 对象",
       all(json.load(io.open(KIND_FILES[k], encoding="utf-8"))["schema"]
-          == P._USAGE_CACHE_SCHEMA and P._USAGE_CACHE_SCHEMA == 4
+          == P._USAGE_CACHE_SCHEMA and P._USAGE_CACHE_SCHEMA == 5
           for k in P._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])),
       P._USAGE_CACHE_SCHEMA)
 check("四个 kinds 都在",
@@ -726,7 +727,8 @@ mutate(lambda d: newest_day(d, "series")["hours"].__setitem__(
 
 # 6.2 schema：旧文件整体作废（一次性全量重扫，结果正确）
 mutate_schema(lambda d: d.update({"schema": 2}), "旧 schema（v2，没有日桶）")
-mutate_schema(lambda d: d.update({"schema": 5}), "未来的 schema")
+mutate_schema(lambda d: d.update({"schema": 4}), "旧 schema（v4，价格指纹是旧形状）")
+mutate_schema(lambda d: d.update({"schema": 6}), "未来的 schema")
 mutate_schema(lambda d: d.update({"schema": True}), "schema 写成 true")
 
 print()

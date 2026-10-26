@@ -37,6 +37,19 @@ PROVIDER_ID = "wb-proxy"
 PROVIDER_NAME = "WB Proxy"
 CREDENTIAL_REF = "WB_PROXY_API_KEY"
 
+# WorkBuddy 的模型冷却（429）通常持续一分钟左右，而 DSH 自带的重试策略是
+# normal / 5 次 / 退避 500ms→10s：合计约 15s 就放弃，冷却还没结束整个回合
+# 就以 RATE_LIMIT 失败收场，表现就是「调用到一半链接中断」。给 wb-proxy 这个
+# provider 单独放宽：最多 8 次、退避从 2s 起、封顶 30s，合计约 2 分半，足够
+# 熬过一次 60s 冷却。只影响 wb-proxy，DSH 其它 provider 仍用默认策略。
+# 字段名与取值范围见 @deepseek-ai/dsh-llm 的 RetryPolicySchema。
+DSH_RETRY_POLICY = {
+    "mode": "normal",
+    "maxRetries": 8,
+    "backoff": {"initialDelayMs": 2000, "maxDelayMs": 30000,
+                "jitterRatio": 0.1},
+}
+
 # A config file bigger than this is almost certainly not the hand-edited
 # settings file we expect, so refuse rather than risk corrupting user data.
 MAX_CONFIG_BYTES = 8 * 1024 * 1024
@@ -88,25 +101,70 @@ def _read_text(path):
         raise AgentConfigError("%s is not valid UTF-8: %s" % (path, exc))
 
 
-def _atomic_write_text(path, text):
-    """tmp + os.replace so a crash cannot leave a half-written config."""
+# Every file this module writes carries the gateway API key (inline, or via the
+# env reference that the sibling credentials file resolves), so a fresh one is
+# created owner-only rather than with open()'s 0666 & ~umask - 0644 under the
+# usual umask 022. DSH refuses to start when its credentials file is readable
+# beyond its owner, and the same 0644 would expose every other client's key.
+WRITE_MODE = 0o600
+
+
+def _target_mode(path):
+    """The mode to give `path` on the next write.
+
+    `WRITE_MODE` for a new file, or for one whose current mode is wider than
+    owner-only (or does not even let its owner read it back); otherwise the
+    file's own mode, so a re-apply preserves a stricter permission the user set
+    by hand instead of widening it back - 0600 -> 0600 and 0400 -> 0400, but
+    0644 -> 0600.
+    """
+    try:
+        current = os.stat(path).st_mode & 0o777
+    except OSError:
+        return WRITE_MODE
+    if current & 0o077 or not current & 0o400:
+        return WRITE_MODE
+    return current
+
+
+def _atomic_write(path, data):
+    """tmp + os.replace so a crash cannot leave a half-written config.
+
+    The temp file is created owner-only (see `_target_mode`) rather than with
+    the umask's default, and settled on the resolved mode after writing. Any
+    failure on the way - including the chmod or the replace - removes the temp
+    file, so a retry never trips over a leftover it cannot write to.
+    """
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    mode = _target_mode(path)
+    try:
+        os.unlink(tmp)  # a stale temp from a killed run may not be writable
+    except OSError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp, flags, WRITE_MODE)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_text(path, text):
+    _atomic_write(path, text.encode("utf-8"))
 
 
 def _atomic_write_bytes(path, data):
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as fh:
-        fh.write(data)
-    os.replace(tmp, path)
+    _atomic_write(path, data)
 
 
 def _prune_empty_parents(path, home=None):
@@ -237,6 +295,69 @@ def _yaml_inline_to_block(lines, idx, key, inline_value):
         "can be expanded" % (key, inline_value))
 
 
+def _yaml_scalar(value):
+    """One scalar in block-style YAML; JSON-compatible quoting when needed."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if value is None:
+        return "null"
+    text = str(value)
+    if re.match(r"^[A-Za-z0-9_][A-Za-z0-9_ ./:@+()\[\]{}<>~-]*$", text) \
+            and not text.endswith(" ") and ": " not in text \
+            and " #" not in text:
+        return text
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _yaml_emit(value, indent):
+    """Block-style lines for `value` at `indent` (dict/list/scalar subset)."""
+    pad = " " * indent
+    if isinstance(value, dict):
+        out = []
+        for key, item in value.items():
+            name = _yaml_scalar(str(key))
+            if isinstance(item, dict):
+                out.append(pad + name + ":")
+                out.extend(_yaml_emit(item, indent + 2))
+            elif isinstance(item, list):
+                out.append(pad + name + ":")
+                out.extend(_yaml_emit_list(item, indent + 2))
+            else:
+                out.append(pad + name + ": " + _yaml_scalar(item))
+        return out
+    if isinstance(value, list):
+        return _yaml_emit_list(value, indent)
+    return [pad + _yaml_scalar(value)]
+
+
+def _yaml_emit_list(items, indent):
+    pad = " " * indent
+    out = []
+    for item in items:
+        if isinstance(item, dict):
+            first = True
+            for key, val in item.items():
+                prefix = pad + ("- " if first else "  ")
+                name = _yaml_scalar(str(key))
+                if isinstance(val, dict):
+                    out.append(prefix + name + ":")
+                    out.extend(_yaml_emit(val, indent + 4))
+                elif isinstance(val, list):
+                    out.append(prefix + name + ":")
+                    out.extend(_yaml_emit_list(val, indent + 4))
+                else:
+                    out.append(prefix + name + ": " + _yaml_scalar(val))
+                first = False
+        elif isinstance(item, list):
+            raise AgentConfigError(
+                "nested lists are outside the supported subset")
+        else:
+            out.append(pad + "- " + _yaml_scalar(item))
+    return out
+
+
 def yaml_upsert_inline(text, key_path, value):
     """Upsert a nested mapping key with an inline-flow (JSON-compatible) value.
 
@@ -256,8 +377,31 @@ def yaml_upsert_inline(text, key_path, value):
     return "\n".join(lines)
 
 
-def _yaml_upsert_at(lines, start, end, indent, keys, value_json):
-    """Recursive block scanner for yaml_upsert_inline; returns new lines."""
+def yaml_upsert_block(text, key_path, value):
+    """Upsert a nested mapping key as a block-style subtree.
+
+    Same addressing and preservation rules as yaml_upsert_inline, but the
+    leaf is emitted as block lines (see `_yaml_emit`) instead of one inline
+    JSON line - which is what a DSH profile patch layer wants for a provider
+    entry that carries a models list.
+    """
+    keys = [part.strip() for part in str(key_path).split(".") if part.strip()]
+    if not keys:
+        raise AgentConfigError("yaml_upsert_block: empty key path")
+    lines = text.split("\n")
+    lines = _yaml_upsert_at(
+        lines, 0, len(lines), 0, keys,
+        value_lines=lambda indent: _yaml_emit(value, indent))
+    return "\n".join(lines)
+
+
+def _yaml_upsert_at(lines, start, end, indent, keys, value_json=None,
+                    value_lines=None):
+    """Recursive block scanner for the upsert helpers; returns new lines.
+
+    A leaf is written either as one inline `key: <json>` line (`value_json`)
+    or as a block: `key:` plus the lines `value_lines(indent + 2)` returns.
+    """
     key = keys[0]
     idx = start
     while idx < end:
@@ -267,8 +411,12 @@ def _yaml_upsert_at(lines, start, end, indent, keys, value_json):
             after = line.split(":", 1)[1].strip()
             child_end = _yaml_block_end(lines, idx, indent)
             if len(keys) == 1:
-                # Replace this leaf line, keeping its indentation.
-                lines[idx] = " " * indent + key + ": " + value_json
+                if value_lines is not None:
+                    lines[idx:child_end] = (
+                        [" " * indent + key + ":"] + value_lines(indent + 2))
+                else:
+                    # Replace this leaf line, keeping its indentation.
+                    lines[idx] = " " * indent + key + ": " + value_json
                 return lines
             if after:
                 # Parent currently holds an inline value: expand `{..}` into
@@ -276,20 +424,26 @@ def _yaml_upsert_at(lines, start, end, indent, keys, value_json):
                 _yaml_inline_to_block(lines, idx, key, after)
                 child_end = _yaml_block_end(lines, idx, indent)
                 lines = _yaml_upsert_at(lines, idx + 1, child_end,
-                                        indent + 2, keys[1:], value_json)
+                                        indent + 2, keys[1:], value_json,
+                                        value_lines)
                 return lines
             lines = _yaml_upsert_at(lines, idx + 1, child_end,
-                                    indent + 2, keys[1:], value_json)
+                                    indent + 2, keys[1:], value_json,
+                                    value_lines)
             return lines
         idx += 1
     # Key not found in this block: append it at the block's end.
     insert = _yaml_insert_point(lines, start, end, indent)
     if len(keys) == 1:
-        new_lines = [" " * indent + key + ": " + value_json]
+        if value_lines is not None:
+            new_lines = [" " * indent + key + ":"] + value_lines(indent + 2)
+        else:
+            new_lines = [" " * indent + key + ": " + value_json]
     else:
         new_lines = [" " * indent + keys[0] + ":"]
         new_lines.extend(
-            _yaml_upsert_at([], 0, 0, indent + 2, keys[1:], value_json))
+            _yaml_upsert_at([], 0, 0, indent + 2, keys[1:], value_json,
+                            value_lines))
     lines[insert:insert] = new_lines
     return lines
 
@@ -399,6 +553,33 @@ def toml_upsert_table(text, table, mapping):
     for key in mapping:
         lines.append("%s = %s" % (key, _toml_value(mapping[key])))
     return "\n".join(lines) + "\n"
+
+
+def toml_drop_table_keys(text, table, keys):
+    """Drop keys from [table], leaving every other line untouched.
+
+    The one-click config used to write env_key; Codex 0.163 resolves that
+    variable at startup and fails hard when the GUI did not inherit it, so the
+    key has to be removed when the provider switches to an inline token.
+    """
+    wanted = set(keys)
+    lines = text.split("\n")
+    idx = 0
+    while idx < len(lines):
+        m = _TOML_TABLE_RE.match(lines[idx])
+        if m and m.group(1) == table:
+            end = idx + 1
+            while end < len(lines) and not _TOML_TABLE_RE.match(lines[end]):
+                end += 1
+            kept = [lines[idx]]
+            for line in lines[idx + 1:end]:
+                km = _TOML_KEY_RE.match(line)
+                if km and km.group(1) in wanted:
+                    continue
+                kept.append(line)
+            return "\n".join(lines[:idx] + kept + lines[end:])
+        idx += 1
+    return text
 
 
 def _toml_upsert_in_range(lines, start, end, mapping):
@@ -545,12 +726,19 @@ def _apply_codex(paths, ctx):
     text = toml_upsert_top_key(text, "model_provider", PROVIDER_ID)
     if ctx.get("model"):
         text = toml_upsert_top_key(text, "model", ctx["model"])
+    # Codex 0.163 resolves env_key at startup and aborts with
+    # "Missing environment variable: OPENAI_API_KEY" when the variable is not
+    # in the process environment; auth.json no longer satisfies it. Put the
+    # key on the provider itself, and drop the stale env_key so both are not
+    # present at once (env_key would win and fail again).
     text = toml_upsert_table(text, "model_providers." + PROVIDER_ID, {
         "name": PROVIDER_NAME,
         "base_url": ctx["base_url_v1"],
         "wire_api": "responses",
-        "env_key": "OPENAI_API_KEY",
+        "experimental_bearer_token": ctx["api_key"],
     })
+    text = toml_drop_table_keys(text, "model_providers." + PROVIDER_ID,
+                                ("env_key", "env_key_instructions"))
     auth_path = paths["auth"]
     auth = _load_json(auth_path, "codex auth")
     auth = deep_merge(auth, {"OPENAI_API_KEY": ctx["api_key"]})
@@ -565,8 +753,22 @@ def _apply_opencode(paths, ctx):
     models = {}
     for entry in ctx.get("models") or []:
         mid = entry.get("id")
-        if mid:
-            models[mid] = {}
+        if not mid:
+            continue
+        limits = {}
+        try:
+            context = int(entry.get("context_window") or 0)
+        except (TypeError, ValueError):
+            context = 0
+        try:
+            output = int(entry.get("max_output") or 0)
+        except (TypeError, ValueError):
+            output = 0
+        if context > 0:
+            limits["context"] = context
+        if output > 0:
+            limits["output"] = output
+        models[mid] = {"limit": limits} if limits else {}
     provider = {
         "npm": "@ai-sdk/openai-compatible",
         "name": PROVIDER_NAME,
@@ -578,14 +780,211 @@ def _apply_opencode(paths, ctx):
     if models:
         provider["models"] = models
     data = deep_merge(data, {"provider": {PROVIDER_ID: provider}})
+    # models 是「这次勾选了哪些」的快照，必须整体替换：deep_merge 只做并集，
+    # 会把上一轮写过、这一轮取消勾选的 id 留在客户端的 models 字典里。同层的
+    # npm / options 等仍按 deep_merge 保留用户自己加的键。
+    entry = (data.get("provider") or {}).get(PROVIDER_ID)
+    if isinstance(entry, dict):
+        if models:
+            entry["models"] = models
+        else:
+            entry.pop("models", None)
     if ctx.get("model"):
         data["model"] = "%s/%s" % (PROVIDER_ID, ctx["model"])
     return {path: _dump_json(data)}
 
 
+def dsh_reasoning_levels(raw):
+    """{档位: 线上拼写} for DSH, from the gateway's `reasoning_efforts` list.
+
+    DSH 的模型条目用 `reasoningEfforts` 声明可选思考档位（键=选择器里的档位，
+    值=请求里实际发的拼写）。本路由不在它的内置目录里，所以不声明就没有选择
+    器——`/v1/models` 里的 `reasoning_efforts` 它不读，它只读 id / name /
+    contextWindow / maxTokens。网关宣告的档位名就是上游认的拼写，一一照抄即可；
+    固定档位的模型（网关只给 reasoning_fixed_effort）没有列表，就不声明：给了
+    选择器也不会改变上游实际跑的档位。
+    """
+    if isinstance(raw, dict):
+        pairs = list(raw.items())
+    elif isinstance(raw, (list, tuple)):
+        pairs = [(lvl, lvl) for lvl in raw]
+    else:
+        return None
+    levels = {}
+    for level, wire in pairs:
+        name = str(level or "").strip()
+        if not name:
+            continue
+        levels[name] = str(wire or "").strip() or name
+    return levels or None
+
+
+def dsh_default_model(text, provider, model):
+    """The `agent-default-model` entry to write, keeping keys we do not own.
+
+    yaml_upsert_inline() replaces that leaf wholesale, so writing a bare
+    {provider, model} silently drops whatever the user set beside it - a
+    reasoningEffort, for instance, which is how a default thinking level gets
+    lost on a re-apply. Read the current inline mapping and merge the route
+    over it; a block-style or unparsable value falls back to the bare pair
+    rather than guessing.
+    """
+    out = {"provider": provider, "model": model}
+    for line in str(text or "").split("\n"):
+        stripped = line.strip()
+        if not stripped.startswith("agent-default-model:"):
+            continue
+        raw = stripped.split(":", 1)[1].strip()
+        if raw.startswith("{"):
+            try:
+                current = json.loads(raw)
+            except ValueError:
+                current = None
+            if isinstance(current, dict):
+                out = dict(current)
+        break
+    out["provider"] = provider
+    out["model"] = model
+    return out
+
+
+def dsh_profile_patches(home):
+    """Existing DSH profile patch layers, e.g. ~/.dsh/profiles/desktop/...
+
+    Current DSH imports a legacy `settings.yaml` once and renames it to
+    `settings.yaml.imported`; after that the user-owned configuration lives
+    in each profile's `cordis.patch.yml`. Every profile that has one is
+    returned, sorted for a stable write order.
+    """
+    root = os.path.join(str(home or ""), ".dsh", "profiles")
+    out = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for name in names:
+        path = os.path.join(root, name, "cordis.patch.yml")
+        if os.path.isfile(path):
+            out.append(path)
+    return out
+
+
+def _dsh_files(home):
+    """Files DSH integration writes: profile patch layers, or settings.yaml.
+
+    Current DSH keeps user configuration in each profile's
+    cordis.patch.yml; settings.yaml is only the pre-profile legacy layer, so
+    it is still written when it already exists (never created next to a
+    profile) and stays the target on an install without profiles.
+    """
+    files = {"credentials": os.path.join(home, ".dsh", ".credentials.yaml")}
+    settings = os.path.join(home, ".dsh", "settings.yaml")
+    patches = dsh_profile_patches(home)
+    if patches:
+        for idx, path in enumerate(patches):
+            files["patch-%d" % idx] = path
+        if os.path.isfile(settings):
+            files["settings"] = settings
+    else:
+        files["settings"] = settings
+    return files
+
+
+def _yaml_unquote(raw):
+    raw = str(raw or "").strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        return raw[1:-1]
+    return raw
+
+
+def _dsh_patch_items(lines):
+    """(start, end) line ranges of the top-level list items in a patch."""
+    starts = [idx for idx, line in enumerate(lines)
+              if line.startswith("- ") or line.rstrip() == "-"]
+    return [(start, starts[i + 1] if i + 1 < len(starts) else len(lines))
+            for i, start in enumerate(starts)]
+
+
+def _dsh_patch_item_id(lines, start, end):
+    m = re.match(r"^-\s+id:\s*(.+?)\s*$", lines[start])
+    if m:
+        return _yaml_unquote(m.group(1))
+    for idx in range(start + 1, end):
+        if _yaml_indent(lines[idx]) != 2:
+            continue
+        m = re.match(r"^id:\s*(.+?)\s*$", lines[idx].strip())
+        if m:
+            return _yaml_unquote(m.group(1))
+    return None
+
+
+def _dsh_patch_find(lines, entry_id):
+    for start, end in _dsh_patch_items(lines):
+        if _dsh_patch_item_id(lines, start, end) == entry_id:
+            return start, end
+    return None
+
+
+def _dsh_patch_entry(entry_id, name, config_lines):
+    out = ["- id: %s" % _yaml_scalar(entry_id)]
+    if name:
+        out.append("  name: %s" % _yaml_scalar(name))
+    out.append("  config:")
+    out.extend(config_lines)
+    return out
+
+
+def dsh_patch_upsert(text, provider, model=None):
+    """Upsert the gateway provider (and default route) into a patch layer.
+
+    The profile's cordis.patch.yml is a top-level YAML list of loader
+    entries. Only the two entries this integration owns are touched - the
+    `llm-pi-ai` provider block and `agent-default-model` - so other
+    providers, entries, comments and ordering survive byte for byte. A
+    brand-new profile ships `[]` as the whole document, which is replaced by
+    the entries instead of being appended to.
+    """
+    lines = str(text or "").split("\n")
+    for idx, line in enumerate(lines):
+        if line.strip() == "[]":
+            del lines[idx]
+            break
+    if lines and lines[-1] == "":
+        lines.pop()
+
+    found = _dsh_patch_find(lines, "llm-pi-ai")
+    if found:
+        start, end = found
+        lines = _yaml_upsert_at(
+            lines, start + 1, end, 2, ["config", "providers", PROVIDER_ID],
+            value_lines=lambda indent: _yaml_emit(provider, indent))
+    else:
+        lines.extend(_dsh_patch_entry(
+            "llm-pi-ai", "@deepseek-ai/dsh-llm-pi-ai",
+            ["    providers:"] + _yaml_emit({PROVIDER_ID: provider}, 6)))
+
+    if model:
+        found = _dsh_patch_find(lines, "agent-default-model")
+        if found:
+            start, end = found
+            lines = _yaml_upsert_at(
+                lines, start + 1, end, 2, ["config", "provider"],
+                value_json=json.dumps(PROVIDER_ID))
+            start, end = _dsh_patch_find(lines, "agent-default-model")
+            lines = _yaml_upsert_at(
+                lines, start + 1, end, 2, ["config", "model"],
+                value_json=json.dumps(model))
+        else:
+            lines.extend([
+                "- id: agent-default-model",
+                "  config:",
+                "    provider: %s" % _yaml_scalar(PROVIDER_ID),
+                "    model: %s" % _yaml_scalar(model),
+            ])
+    return "\n".join(lines) + "\n"
+
+
 def _apply_dsh(paths, ctx):
-    settings_path = paths["settings"]
-    text = _read_text(settings_path)
     models = []
     for entry in ctx.get("models") or []:
         mid = entry.get("id")
@@ -594,25 +993,58 @@ def _apply_dsh(paths, ctx):
         item = {"id": mid}
         if entry.get("context_window"):
             item["contextWindow"] = entry["context_window"]
+        if entry.get("max_output"):
+            try:
+                item["maxTokens"] = int(entry["max_output"])
+            except (TypeError, ValueError):
+                pass
+        levels = dsh_reasoning_levels(entry.get("reasoning_efforts"))
+        if levels:
+            item["reasoningEfforts"] = levels
+        if entry.get("supports_vision") or entry.get("supportsVision"):
+            # DSH's pi-ai adapter reads the declared input modalities, not a
+            # supportsVision flag: without `input` a model counts as text-only
+            # and a pasted image is rejected with MODEL_DOES_NOT_SUPPORT_IMAGES.
+            item["input"] = ["text", "image"]
         models.append(item)
     provider = {
         "displayName": PROVIDER_NAME,
         "apiKeyEnv": CREDENTIAL_REF,
         "api": "openai-completions",
         "baseURL": ctx["base_url_v1"],
+        # wb-proxy 不在 DSH 的内置目录里，推理字段的线上形状必须自己说明：
+        # 走标准 reasoning_effort，不发 thinking 块——DeepSeek 系需要的那份
+        # thinking / reasoning_content 由网关补（wb_proxy.build_upstream_body）。
+        "compat": {"thinkingFormat": "openai", "supportsReasoningEffort": True},
+        # 冷却等待：见文件顶部 DSH_RETRY_POLICY 的说明（深拷贝，避免各
+        # profile 的 provider 条目共享同一个 backoff 映射）。
+        "retryPolicy": json.loads(json.dumps(DSH_RETRY_POLICY)),
     }
     if models:
         provider["models"] = models
-    text = yaml_upsert_inline(
-        text, "llm-pi-ai.providers.%s" % PROVIDER_ID, provider)
-    if ctx.get("model"):
+
+    out = {}
+    patches = dsh_profile_patches(ctx.get("home"))
+    for path in patches:
+        out[path] = dsh_patch_upsert(
+            _read_text(path), provider, ctx.get("model"))
+    settings_path = paths.get("settings")
+    if settings_path and (not patches or os.path.isfile(settings_path)):
+        # Legacy layer: an install that predates profile patch files (or a
+        # user who still keeps settings.yaml around) keeps getting it.
         text = yaml_upsert_inline(
-            text, "agent-default-model",
-            {"provider": PROVIDER_ID, "model": ctx["model"]})
+            _read_text(settings_path),
+            "llm-pi-ai.providers.%s" % PROVIDER_ID, provider)
+        if ctx.get("model"):
+            text = yaml_upsert_inline(
+                text, "agent-default-model",
+                dsh_default_model(text, PROVIDER_ID, ctx["model"]))
+        out[settings_path] = text
     credentials_path = paths["credentials"]
     cred_text = _read_text(credentials_path)
     cred_text = yaml_refs_upsert(cred_text, CREDENTIAL_REF, ctx["api_key"])
-    return {settings_path: text, credentials_path: cred_text}
+    out[credentials_path] = cred_text
+    return out
 
 
 def _apply_crush(paths, ctx):
@@ -762,12 +1194,10 @@ CLIENTS = {
     "dsh": {
         "id": "dsh",
         "label": "DeepSeek Harness",
-        "desc": "DSH; adds a wb-proxy provider to settings.yaml.",
+        "desc": "DSH; adds a wb-proxy provider to the profile patch layer "
+                "(legacy settings.yaml kept).",
         "protocol": "openai",
-        "files": lambda home: {
-            "settings": os.path.join(home, ".dsh", "settings.yaml"),
-            "credentials": os.path.join(home, ".dsh", ".credentials.yaml"),
-        },
+        "files": _dsh_files,
         "probe": lambda home: (
             os.path.isdir(os.path.join(home, ".dsh"))
             or os.path.isfile(os.path.join(home, ".dsh", "settings.yaml"))
@@ -891,6 +1321,9 @@ def plan(client_id, base_url, api_key, model=None, models=None, home=None):
         "api_key": str(api_key or ""),
         "model": str(model or "").strip() or None,
         "models": list(models or []),
+        # A few clients (DSH) resolve their own config paths from the home
+        # directory rather than only the paths map, so apply() sees it too.
+        "home": home,
     }
     paths = client["files"](home)
     try:
@@ -1119,6 +1552,22 @@ def fetch_models_from_gateway(base_url, api_key, timeout=10):
                 entry["max_output"] = int(out_tokens)
             except (TypeError, ValueError):
                 pass
+        efforts = item.get("reasoning_efforts")
+        if isinstance(efforts, (list, tuple)):
+            levels = [str(e).strip() for e in efforts if str(e or "").strip()]
+            if levels:
+                entry["reasoning_efforts"] = levels
+        # Image input: DSH only reads the model entry's `input` modalities, so
+        # the CLI line has to carry the gateway's vision flag through (the
+        # panel line gets it from `_agents_models` directly). Accept every
+        # spelling the gateway emits: flat flag first, then the generic one.
+        vision = item.get("supports_vision")
+        if vision is None:
+            capabilities = item.get("capabilities")
+            if isinstance(capabilities, dict):
+                vision = capabilities.get("vision")
+        if vision:
+            entry["supports_vision"] = True
         name = item.get("name")
         if name:
             entry["name"] = str(name)

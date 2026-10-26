@@ -198,8 +198,8 @@ class UnionInputTests(PricingTestCase):
         def fake(realm):
             asked.append(realm)
             if realm == "cn":
-                return [("glm-5.3-flashx", {}), ("kimi-k2.6", {})], True
-            return [("glm-5.3-flashx", {}), ("glm-5.3-flash", {})], True
+                return [("glm-5.3-flashx", {}), ("kimi-k2.6", {})], True, "remote"
+            return [("glm-5.3-flashx", {}), ("glm-5.3-flash", {})], True, "remote"
 
         P.curated_live_sources = fake
         try:
@@ -217,7 +217,7 @@ class UnionInputTests(PricingTestCase):
         def fake(realm):
             if realm == "cn":
                 raise RuntimeError("cn catalogue down")
-            return [("glm-5.3-flashx", {})], True
+            return [("glm-5.3-flashx", {})], True, "remote"
 
         P.curated_live_sources = fake
         try:
@@ -255,7 +255,7 @@ class FakeGateway(object):
     VIRTUAL_ALIAS_MODELS = ("default-model", "auto")
 
     def curated_live_sources(self, realm):
-        return ([], True)
+        return ([], True, None)
 
 
 sys.modules["__main__"] = FakeGateway()
@@ -297,7 +297,7 @@ class SingleGatewayInstanceTests(PricingTestCase):
 
             def curated_live_sources(self, realm):
                 self.realms.append(realm)
-                return ([("gpt-6-sol", {})], True)
+                return ([("gpt-6-sol", {})], True, "remote")
 
             def add_log_entry(self, message, tag=None):
                 self.lines.append((message, tag))
@@ -646,7 +646,7 @@ class GapReportTests(PricingTestCase):
         original = P.curated_live_sources
         P.curated_live_sources = lambda realm: (
             ([("glm-5.3-flash-20260101", {})] if realm == "intl"
-             else [("glm-5.3-flashx", {})]), True)
+             else [("glm-5.3-flashx", {})]), True, "remote")
         try:
             refresher = self._refresher()
             ok, message = refresher.run_once()

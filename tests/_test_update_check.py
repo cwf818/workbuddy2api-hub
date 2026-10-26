@@ -264,6 +264,144 @@ class CheckBehaviourTests(unittest.TestCase):
             self.assertTrue(revived.status()["update_available"])
 
 
+class StartupCheckTests(unittest.TestCase):
+    """The pass that runs right after a process start.
+
+    The stored bookkeeping carries only the version number, so a restart has no
+    tag and no release page in memory. Without one check at startup the panel
+    shows "an update is available" while the install button demands a manual
+    check first - and the 24h window, anchored at the previous attempt, keeps it
+    that way for up to a day.
+    """
+
+    def _restarted(self, directory, fetcher):
+        """A checker that just came up after a check an hour ago."""
+        wb_settings.set_update_check_enabled(directory, True)
+        wb_settings.record_update_check(directory, at=time.time() - 3600,
+                                        success=True, latest_version="1.6.18")
+        return checker(directory, fetcher)
+
+    def test_a_restart_checks_even_inside_the_24h_window(self):
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            fetcher = FakeFetcher([release("v1.6.18")])
+            worker = self._restarted(d, fetcher)
+            self.assertFalse(worker.due(), "the 24h window is still closed")
+            status = worker.check(manual=False, startup=True)
+            self.assertEqual(len(fetcher.calls), 1, "startup bypasses the 24h window")
+            self.assertNotIn("skipped", status)
+
+    def test_the_startup_check_makes_the_install_path_usable(self):
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            worker = self._restarted(d, FakeFetcher([release("v1.6.18")]))
+            worker.check(manual=False, startup=True)
+            status = worker.status()
+            self.assertEqual(status["latest_tag"], "v1.6.18")
+            self.assertTrue(status["release_url"].endswith("/releases/tag/v1.6.18"))
+            self.assertTrue(status["update_available"])
+
+    def test_the_scheduled_pass_keeps_its_window(self):
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            fetcher = FakeFetcher([release("v1.6.18")])
+            worker = self._restarted(d, fetcher)
+            worker.check(manual=False, startup=True)
+            second = worker.check(manual=False)
+            self.assertEqual(len(fetcher.calls), 1, "steady state is still once a day")
+            self.assertEqual(second["skipped"], "not due yet")
+
+    def test_the_switch_still_wins_at_startup(self):
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            fetcher = FakeFetcher([release("v1.6.18")])
+            worker = checker(d, fetcher)
+            status = worker.check(manual=False, startup=True)
+            self.assertEqual(fetcher.calls, [], "off means no request, boot or not")
+            self.assertEqual(status["skipped"], "disabled")
+
+    def test_a_restart_checks_seconds_after_the_last_one(self):
+        # The case a minimum interval would break: check -> install -> the
+        # executor's own restart lands well inside any sane floor, and the panel
+        # needs the tag right then.
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            wb_settings.set_update_check_enabled(d, True)
+            wb_settings.record_update_check(d, at=time.time() - 20,
+                                            success=True, latest_version="1.6.18")
+            fetcher = FakeFetcher([release("v1.6.18")])
+            worker = checker(d, fetcher)
+            self.assertFalse(worker.due(), "the 24h window is still closed")
+            status = worker.check(manual=False, startup=True)
+            self.assertEqual(len(fetcher.calls), 1)
+            self.assertNotIn("skipped", status)
+
+    def _spent_budget(self, directory, count=6, age=60):
+        wb_settings.set_update_check_enabled(directory, True)
+        wb_settings.record_update_check(directory, at=time.time() - 3600,
+                                        success=True, latest_version="1.6.18")
+        for index in range(count):
+            wb_settings.record_startup_check(directory, at=time.time() - age - index)
+
+    def test_the_budget_caps_a_crash_restart_loop(self):
+        # Six startups in an hour is a broken deployment, not a normal one: the
+        # seventh start stops asking instead of spending the anonymous quota.
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            self._spent_budget(d)
+            fetcher = FakeFetcher([release("v1.6.18")])
+            worker = checker(d, fetcher)
+            status = worker.check(manual=False, startup=True)
+            self.assertEqual(fetcher.calls, [], "the budget is spent, no request")
+            self.assertEqual(status["skipped"], "startup budget spent")
+
+    def test_the_budget_frees_up_after_the_window(self):
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            self._spent_budget(d, age=wb_updates.STARTUP_CHECK_WINDOW_SECONDS + 100)
+            fetcher = FakeFetcher([release("v1.6.18")])
+            worker = checker(d, fetcher)
+            worker.check(manual=False, startup=True)
+            self.assertEqual(len(fetcher.calls), 1, "an hour later it asks again")
+
+    def test_a_startup_check_spends_one_unit_of_the_budget(self):
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            worker = self._restarted(d, FakeFetcher([release("v1.6.18")]))
+            worker.check(manual=False, startup=True)
+            stamps = wb_settings.update_check_state(d)["startup_checks"]
+            self.assertEqual(len(stamps), 1, "the pass is recorded for the next boot")
+            # A second boot reads it back and spends the second unit.
+            again = checker(d, FakeFetcher([release("v1.6.18")]))
+            self.assertEqual(again._startup_checks, stamps)
+            self.assertTrue(again.startup_due())
+
+    def test_manual_checks_do_not_spend_the_startup_budget(self):
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            fetcher = FakeFetcher([release("v1.6.18")] * 8)
+            worker = self._restarted(d, fetcher)
+            for _ in range(6):
+                worker.check(manual=True)
+            status = worker.check(manual=False, startup=True)
+            self.assertNotIn("skipped", status, "the panel's button is not rationed")
+            self.assertEqual(len(fetcher.calls), 7)
+
+    def test_the_ledger_stays_bounded(self):
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            for index in range(40):
+                wb_settings.record_startup_check(d, at=time.time() - index)
+            stamps = wb_settings.update_check_state(d)["startup_checks"]
+            self.assertLessEqual(len(stamps), wb_settings.STARTUP_CHECK_STAMPS_KEPT)
+            self.assertEqual(stamps, sorted(stamps))
+
+    def test_the_worker_checks_once_when_it_starts(self):
+        with tempfile.TemporaryDirectory(prefix="upd-boot-") as d:
+            self._restarted(d, FakeFetcher([]))
+            fetcher = FakeFetcher([release("v1.6.18")])
+            worker = checker(d, fetcher)
+            worker.start()
+            deadline = time.time() + 5
+            while not fetcher.calls and time.time() < deadline:
+                time.sleep(0.02)
+            time.sleep(0.2)                      # give the loop room to over-fetch
+            worker.stop()
+            worker.join(timeout=5)
+        self.assertEqual(len(fetcher.calls), 1,
+                         "one startup pass, then the 24h window takes over")
+
+
 class FailureHandlingTests(unittest.TestCase):
     def _failing(self, directory, error):
         fetcher = FakeFetcher(error=error)
@@ -452,11 +590,17 @@ class RouteTests(unittest.TestCase):
         _handle_settings_save = proxy.Handler._handle_settings_save
         _get_updates = proxy.Handler._get_updates
         _route_update_check = proxy.Handler._route_update_check
+        _route_update_install = proxy.Handler._route_update_install
 
         def __init__(self, payload=None):
             self.payload = payload
             self.status = None
             self.reply = None
+            self.server = self._FakeServer()
+
+        class _FakeServer(object):
+            server_address = ("127.0.0.1", 8788)
+            server_port = 8788
 
         def _payload_or_error(self, allow_list=False):
             return self.payload
@@ -539,6 +683,32 @@ class RouteTests(unittest.TestCase):
             self.assertEqual(request.reply["latest_version"], "1.6.18")
             self.assertTrue(request.reply["update_available"])
             self.assertEqual(len(fetcher.calls), 1)
+
+    def test_manual_install_queues_only_the_checked_newer_release(self):
+        with tempfile.TemporaryDirectory(prefix="upd-install-route-") as d:
+            worker = checker(d, FakeFetcher([release("v1.6.18")]))
+            worker.check(manual=True)
+            with mock.patch.object(proxy, "UPDATES", worker), \
+                    mock.patch.object(proxy.wb_update_request, "request_install",
+                                      return_value={"state": "queued", "version": "1.6.18"}) as queue:
+                request = self.Request()
+                request._route_update_install()
+            self.assertEqual(request.status, 202)
+            self.assertIs(request.reply["ok"], True)
+            self.assertEqual(request.reply["version"], "1.6.18")
+            args, kwargs = queue.call_args
+            self.assertEqual(args, ("v1.6.18", CURRENT))
+            self.assertEqual(kwargs.get("port"), 8788)
+            self.assertFalse(kwargs.get("lan"))
+
+    def test_manual_install_refuses_when_no_new_release_was_checked(self):
+        with tempfile.TemporaryDirectory(prefix="upd-install-none-") as d:
+            worker = checker(d, FakeFetcher([]))
+            with mock.patch.object(proxy, "UPDATES", worker):
+                request = self.Request()
+                request._route_update_install()
+            self.assertEqual(request.status, 409)
+            self.assertFalse(request.reply["ok"])
 
     def test_the_status_route_still_answers_without_a_worker(self):
         with tempfile.TemporaryDirectory(prefix="upd-route-") as d:

@@ -13,6 +13,7 @@ credential); 401/403/429 already have their own paths.
 No network: accounts are built from dicts, the upstream call is stubbed, and
 time.sleep is recorded instead of slept.
 """
+import io
 import json
 import os
 import sys
@@ -201,7 +202,9 @@ class _OpenUpstreamHarness(unittest.TestCase):
             def apply_remaining_weights(self, weights=None):
                 return weights or {}
 
-        return Pool()
+        pool = Pool()
+        pool.accounts = accounts
+        return pool
 
     def run_request(self, urlopen, egress_backoff=None):
         """Call open_upstream once; return (raised, payload) or (None, result)."""
@@ -222,6 +225,108 @@ class _OpenUpstreamHarness(unittest.TestCase):
                 return None, result
         finally:
             wb_proxy.POOL, A.urlopen = old_pool, old_urlopen
+
+
+class RetryRecoveryTests(_OpenUpstreamHarness):
+    """A pool rotation must leave the final real request attempt available."""
+
+    def assert_recovers(self, failures, count=1, egress_backoff=False):
+        for index in range(count):
+            self.add_account("u-retry-%d" % index)
+        calls = []
+
+        def urlopen(req, timeout=30, proxy=""):
+            calls.append(req.full_url)
+            if len(calls) <= len(failures):
+                raise failures[len(calls) - 1]
+            return _Response(_Sock())
+
+        raised, result = self.run_request(urlopen, egress_backoff=egress_backoff)
+        self.assertIsNone(raised)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(calls), len(failures) + 1)
+        self.assertTrue(self.sleeps, "transient retries must back off")
+        result[0].close()
+
+    @staticmethod
+    def reset_error():
+        return urllib.error.URLError(ConnectionResetError(10054, "连接已中断"))
+
+    @staticmethod
+    def timeout_error():
+        return urllib.error.URLError(TimeoutError("The write operation timed out"))
+
+    def test_single_windows_reset_recovers(self):
+        self.assert_recovers([self.reset_error()])
+
+    def test_last_attempt_survives_two_account_rotation(self):
+        self.assert_recovers([self.timeout_error(), self.timeout_error()], count=2)
+
+    def test_timeout_then_windows_reset_recovers(self):
+        self.assert_recovers([self.timeout_error(), self.reset_error()], count=2)
+
+    def test_windows_resets_recover_with_egress_backoff(self):
+        self.assert_recovers([self.reset_error(), self.reset_error()], count=2,
+                             egress_backoff=True)
+        self.assertTrue(all(account.fails == 0 for account in self.accounts))
+
+    def test_local_network_recovers_after_pool_rotation(self):
+        failures = [urllib.error.URLError(OSError(-3, "Temporary failure in name resolution"))
+                    for _ in range(2)]
+        self.assert_recovers(failures, count=2)
+        self.assertTrue(all(account.fails == 0 for account in self.accounts))
+
+    def test_persistent_transport_failure_is_bounded_and_charged_once(self):
+        for index in range(2):
+            self.add_account("u-bounded-%d" % index)
+        calls = []
+
+        def urlopen(req, timeout=30, proxy=""):
+            calls.append(1)
+            raise self.timeout_error()
+
+        raised, result = self.run_request(urlopen)
+        self.assertIsNotNone(raised)
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(account.degrade_count == 1 for account in self.accounts))
+
+    def test_persistent_local_network_failure_is_bounded(self):
+        account = self.add_account("u-offline")
+        calls = []
+
+        def urlopen(req, timeout=30, proxy=""):
+            calls.append(1)
+            raise urllib.error.URLError(OSError(-3, "Temporary failure in name resolution"))
+
+        raised, result = self.run_request(urlopen)
+        self.assertIsInstance(raised, wb_proxy.LocalNetworkError)
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(account.fails, 0)
+
+    def test_connection_refused_cools_each_account_without_repick(self):
+        # A refused connection (dead per-account proxy) is not a blip: each
+        # account is tried once, charged and cooled for 60s, and the pool is
+        # not cleared for another round.
+        for index in range(2):
+            self.add_account("u-refused-%d" % index)
+        calls = []
+
+        def urlopen(req, timeout=30, proxy=""):
+            calls.append(1)
+            raise urllib.error.URLError(
+                ConnectionRefusedError(10061, "目标计算机积极拒绝"))
+
+        started = time.time()
+        raised, result = self.run_request(urlopen)
+        self.assertIsNotNone(raised)
+        self.assertNotIsInstance(raised, wb_proxy.LocalNetworkError)
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 2)
+        for account in self.accounts:
+            self.assertEqual(account.fails, 1)
+            self.assertGreaterEqual(account.cooldown_until, started + 59)
 
 
 class SwitchOnTests(_OpenUpstreamHarness):
@@ -263,6 +368,98 @@ class SwitchOnTests(_OpenUpstreamHarness):
         key = wb_upstream_pool.egress_key(
             account.chat_base_url() + wb_proxy.CHAT_PATH, account.proxy)
         self.assertEqual(wb_egress.streak(key), 1)
+
+    def test_free_model_retries_paid_sibling_only_after_6004_when_opted_in(self):
+        account = self.add_account("u-credit-fallback")
+        reset = time.time() + 600
+        detail = ('{"code":6004,"msg":"usage exceeds frequency limit, '
+                  'reset at 2026-10-16 23:00:00 UTC+8"}')
+        error = urllib.error.HTTPError("https://upstream.invalid", 429,
+                                       "rate limit", {}, io.BytesIO(detail.encode()))
+        sent_models = []
+
+        def urlopen(req, timeout=30, proxy=""):
+            sent_models.append(json.loads(req.data.decode())["model"])
+            if len(sent_models) == 1:
+                raise error
+            return _Response(_Sock())
+
+        with mock.patch.dict(os.environ, {"WB_ENABLE_FREE_MODEL_CREDIT_FALLBACK": "1"}), \
+                mock.patch.object(wb_proxy, "parse_rate_limit_reset", return_value=reset), \
+                mock.patch.object(wb_proxy, "apply_daily_guards", return_value=0), \
+                mock.patch.object(wb_proxy, "remaining_priority_enabled", return_value=False), \
+                mock.patch.object(wb_proxy, "upstream_timeouts", return_value=(2, 2)):
+            raised, result = self.run_request(urlopen)
+
+        self.assertIsNone(raised)
+        self.assertEqual(sent_models, ["deepseek-v4.1-flash",
+                                       "deepseek-v4.1-flash-sg"])
+        self.assertEqual(result[0]._wb_billed_model, "deepseek-v4.1-flash-sg")
+        self.assertGreater(account.cap_until("deepseek-v4.1-flash"), time.time())
+        saved = []
+        with mock.patch.object(wb_proxy, "_persist_usage",
+                               side_effect=lambda row, _label: saved.append(dict(row))):
+            wb_proxy.record_upstream_usage(
+                result[0], "deepseek-v4.1-flash",
+                {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})
+        self.assertEqual(saved[0]["model"], "deepseek-v4.1-flash-sg")
+        self.assertEqual(saved[0]["requested_model"], "deepseek-v4.1-flash")
+        result[0].close()
+        error.close()
+
+    def test_paid_fallback_tries_each_account_before_product_rotation(self):
+        first = self.add_account("u-paid-first")
+        second = self.add_account("u-paid-second")
+        reset = time.time() + 600
+        for account in (first, second):
+            account.note_model_cap("deepseek-v4.1-flash", reset)
+
+        pool = self._pool()
+        pool.count_ready = lambda realm, model=None: sum(
+            a.ready(model=model) for a in self.accounts if a.realm == realm)
+        pool.pick_for_session = lambda realm, session_key=None, exclude=(), model=None, page=None: next(
+            (a for a in self.accounts
+             if a.uid not in exclude and a.realm == realm and a.ready(model=model)), None)
+        paid_cap = urllib.error.HTTPError(
+            "https://upstream.invalid", 429, "rate limit", {},
+            io.BytesIO(b'{"code":6004,"msg":"model limit"}'))
+        sent = []
+        switch_attempts = []
+
+        def urlopen(req, timeout=30, proxy=""):
+            model = json.loads(req.data.decode())["model"]
+            uid = dict((k.lower(), v) for k, v in req.header_items()).get("x-user-id")
+            sent.append((model, uid))
+            if uid == first.uid:
+                raise paid_cap
+            return _Response(_Sock())
+
+        old_pool, old_urlopen = wb_proxy.POOL, A.urlopen
+        wb_proxy.POOL, A.urlopen = pool, urlopen
+        try:
+            with mock.patch.dict(os.environ,
+                                 {"WB_ENABLE_FREE_MODEL_CREDIT_FALLBACK": "1"}), \
+                    mock.patch.object(wb_proxy, "apply_daily_guards", return_value=0), \
+                    mock.patch.object(wb_proxy, "remaining_priority_enabled", return_value=False), \
+                    mock.patch.object(wb_proxy, "upstream_timeouts", return_value=(2, 2)), \
+                    mock.patch.object(wb_proxy, "auto_switch_product_enabled", return_value=True), \
+                    mock.patch.object(wb_proxy, "_try_switch_product",
+                                      side_effect=lambda account, model: switch_attempts.append(
+                                          (account.uid, model)) or False):
+                response, _account, _effort = wb_proxy.open_upstream(
+                    {"model": "deepseek-v4.1-flash", "messages": [
+                        {"role": "user", "content": "hi"}]}, target_realm="intl")
+        finally:
+            wb_proxy.POOL, A.urlopen = old_pool, old_urlopen
+            paid_cap.close()
+
+        self.assertEqual(sent, [
+            ("deepseek-v4.1-flash-sg", first.uid),
+            ("deepseek-v4.1-flash-sg", second.uid),
+        ])
+        self.assertEqual(switch_attempts, [])
+        self.assertEqual(response._wb_billed_model, "deepseek-v4.1-flash-sg")
+        response.close()
 
     def test_two_accounts_on_one_egress_share_the_counter(self):
         # The point of the whole change: N accounts behind one path must not

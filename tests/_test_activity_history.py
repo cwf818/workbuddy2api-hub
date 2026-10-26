@@ -304,6 +304,10 @@ class RecordingTests(IsolatedCase):
         self.assertEqual(rows[0]["realm"], "intl")
         self.assertTrue(rows[0]["ok"])
 
+        # The same account on a later day: a success today must not hide the
+        # next day's failure row.
+        account.last_daily_chat = None
+
         def boom(req, **kw):
             raise RuntimeError("upstream down")
         with mock.patch.object(wb_accounts, "urlopen", boom):
@@ -338,11 +342,11 @@ class RecordingTests(IsolatedCase):
                                                     "chunks": 0, "elapsed_ms": 5,
                                                     "error": "会话在 120s 内没有跑完"}):
             res = account.daily_chat(web=True, trigger="scheduler")
-        self.assertTrue(res.get("ok"), res)      # 桌面端那一步确实成功了
+        self.assertFalse(res.get("ok"), res)     # 网页腿才算数，它失败整次就是失败
         self.assertFalse(res["web"]["ok"])
         rows = self.rows()
         self.assertEqual(len(rows), 1)
-        self.assertTrue(rows[0]["ok"])
+        self.assertFalse(rows[0]["ok"])
         self.assertIn("网页通道失败", rows[0]["message"])
 
     def test_a_direct_web_trigger_records_its_own_row(self):
@@ -391,9 +395,9 @@ class SchedulerRecordingTests(IsolatedCase):
                 mock.patch.object(wb_scheduler.time, "sleep", lambda *_: None):
             scheduler = wb_scheduler.Scheduler(pool)
             scheduler.cat_hours = []
-            scheduler._run_cycle("测试第一轮")
+            scheduler._run_cycle("测试第一轮", force=True)
             first_round = len(self.rows())
-            scheduler._run_cycle("测试第二轮")
+            scheduler._run_cycle("测试第二轮", force=True)
 
         rows = self.rows()
         self.assertEqual(first_round, 2, "两个到期账号各记一行")

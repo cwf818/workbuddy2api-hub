@@ -6,8 +6,17 @@ accounts/agent-backups/
 # 运行时日志和用量统计
 usage/*.jsonl
 usage/*.json
+usage/*.sqlite3
+usage/*.sqlite3-journal
+usage/*.sqlite3-wal
+usage/*.sqlite3-shm
 !usage/README.txt
 usage/*.bak*
+
+# 运行时模型目录落盘缓存（上游 /v3/config 成功响应的副本，重启后作兜底；删除安全）
+catalog/*.json
+catalog/*.tmp
+!catalog/README.txt
 
 # 运行时日志文件
 logs/
@@ -26,6 +35,12 @@ wrt/ipk/
 wrt/apk/
 # build-apk.sh 把 wb_*.py 暂存进包目录再拷给 SDK，这是构建中间产物
 wrt/openwrt/workbuddy2api/files/usr/lib/
+
+# 项目隔离测试环境
+.venv/
+.playwright-browsers/
+.test-artifacts/
+.pytest_cache/
 
 # Python 编译缓存
 __pycache__/

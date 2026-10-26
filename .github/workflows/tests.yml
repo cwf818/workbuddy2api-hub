@@ -37,7 +37,10 @@ jobs:
         include:
           # The README advertises Python 3.9+, so the floor is exercised on
           # Linux; the primary platform (Windows) runs the current release.
-          - os: ubuntu-latest
+          # Pinned: ubuntu-latest moved to 26.04, where setup-python has no
+          # 3.9 build. 24.04 is the image this leg ran on before the switch;
+          # 22.04's prebuilt 3.9 finds no system CA store (0 certs).
+          - os: ubuntu-24.04
             python: "3.9"
           - os: ubuntu-latest
             python: "3.12"
