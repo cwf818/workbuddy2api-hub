@@ -114,6 +114,11 @@ class FingerprintFastPathTests(unittest.TestCase):
             if not old_has_fingerprint(text):
                 return text
             text = P.SANITIZE_OMO_JUNIOR_RE.sub(replacement, text)
+            text = P.SANITIZE_CLAUDE_AGENT_RE.sub(
+                "A user kicked off a coding task and walked away", text)
+            text = P.SANITIZE_CLAUDE_SDK_RE.sub("You are a coding agent", text)
+            text = P.SANITIZE_CLAUDE_CODE_AGENT_RE.sub(
+                "You are a coding agent", text)
             for old, new in P.SANITIZE_REWRITES:
                 text = text.replace(old, new)
             text = P.SANITIZE_HDR_RE.sub("", text)

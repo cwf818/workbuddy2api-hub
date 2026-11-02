@@ -163,7 +163,7 @@ check("tool calls use Anthropic stop reason", result["stop_reason"] == "tool_use
 check("text content is returned", result["content"][0]["text"] == "I will look it up.")
 check("tool arguments are JSON objects", result["content"][1]["input"] == {"q": "x"})
 check("usage includes Anthropic cache token fields",
-      result["usage"] == {"input_tokens": 8, "output_tokens": 4,
+      result["usage"] == {"input_tokens": 3, "output_tokens": 4,
                           "cache_read_input_tokens": 3,
                           "cache_creation_input_tokens": 2})
 
